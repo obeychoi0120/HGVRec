@@ -8,9 +8,70 @@
 
 ## scene_graph
 
-대상(최신순): [v10_extended](../prompts/scene_graph_v10_extended.md) · [v10_core](../prompts/scene_graph_v10_core.md) → [v9_extended](../prompts/scene_graph_v9_extended.md) · [v9_core](../prompts/scene_graph_v9_core.md) → [v9(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v9.md) → [v8](../prompts/scene_graph_v8.md) → [v7](../prompts/scene_graph_v7.md) → [v6](../prompts/scene_graph_v6.md) → [v5](../prompts/scene_graph_v5.md) → [v4](../prompts/scene_graph_v4.md)
+대상(최신순): [v10_extended](../prompts/scene_graph_v10_extended.md) · [v10_core](../prompts/scene_graph_v10_core.md) → [v9_extended](../prompts/scene_graph_v9_extended.md) · [v9_core](../prompts/scene_graph_v9_core.md) → [v9(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v9.md) → [v8_2](../prompts/scene_graph_v8_2.md) → [v8](../prompts/scene_graph_v8.md) → [v7](../prompts/scene_graph_v7.md) → [v6](../prompts/scene_graph_v6.md) → [v5](../prompts/scene_graph_v5.md) → [v4](../prompts/scene_graph_v4.md)
 
 **개선 흐름: 콘텐츠 맥락과 행동을 분리 → 같은 주제 안의 차별점 보존 → 행동별 역할과 불확실성 명확화 → receiver 제거로 역할 구분 부담 축소 → 이름 직접 참조와 모델 크기별 프롬프트 분리 → 규칙 문장 간소화(v10, 효과 미검증) → tool·place 라벨화와 줄 배치 템플릿(v9·v10, 효과 미검증) → 행동 반복 방지 규칙(v9·v10, 효과 미검증).**
+
+### 2026-11-15: lenient 경로 제거와 ID·이름 형식 공통 복구 (`graph-text/v24`)
+
+프롬프트 파일은 변경하지 않았습니다. 사용자 결정에 따라 v8·v8_2(ID 형식)와 v9·v10(이름 형식)이 같은 파싱 흐름을 타도록 바꾸고, 줄 모양으로 섹션을 추정하던 완화 단계(lenient)를 없앴습니다.
+
+**변경 이유.** v8_2의 `actor_1:` 같은 ID는 lenient 단계의 ID 형식 거부 검사(`[A-Za-z]{1,3}\d+:`)에 걸리지 않습니다. 그래서 형식이 크게 깨진 출력이 들어오면 `actor_1 woman`이라는 이름의 엔티티와, 속성 없는 가짜 엔티티 `actor_1`이 함께 생겼습니다. 행동은 가짜 엔티티에 연결됐고, 그런데도 경고 없이 success로 저장됐습니다. 사용자는 이런 추정 복구 대신 실패로 두고 재생성하는 쪽을 택했습니다(11-13 절단 출력 복구 제거와 같은 방향).
+
+**처리 흐름.**
+
+| | 이전(`graph-text/v23`) | 현재(`graph-text/v24`) |
+| --- | --- | --- |
+| 단계 | JSON → 엄격 → 복구 → lenient(이름 형식만) | JSON → 엄격 → 복구. 그 밖은 `PARSE_FAILED` |
+| `[Context]` 헤더 누락 | 복구: 이름 형식만 | 복구: 두 형식 모두 |
+| `[Entities]` 헤더 누락 | `[Context]`도 없을 때만 복구, `[Context]`가 있으면 lenient | `[Context]` 유무와 관계없이 context 줄이 끝나는 곳에 넣음 |
+| 세미콜론으로 이어진 행동, 행동 사이 `none`, `tool:`·`place:` 라벨 | 복구: 이름 형식만 | 복구: 두 형식 모두 |
+| 미선언 참조 | 이름 형식은 새 엔티티, ID 형식은 `unknown` | 같음(ID에는 붙일 이름이 없음) |
+
+lenient 단계에서만 처리하던 다음 출력은 이제 `PARSE_FAILED`입니다. `[Entities]`·`[Actions]` 헤더가 둘 다 없는 출력, 한 줄 섹션(`Entities: a; b`), target 뒤 라벨 없는 슬롯 3개 이상, 네 번째 행동 구간, 공백 없는 구분자(`man -捞取- fish`), `unknown` 이름의 엔티티, `tool:`·`place:`가 아닌 라벨, 같은 라벨 반복, 출력 뒤에 이어지는 두 번째 그래프가 여기에 해당합니다.
+
+**저장된 Run에 미치는 영향(읽기 전용으로 측정, 파일 수정 없음).** 성공 행은 원문 없이 구조화 그래프만 저장되므로 다시 파싱되지 않고 결과도 바뀌지 않습니다. 따라서 이전에 lenient로 살린 장면이 몇 건인지는 측정할 수 없었습니다. 원문이 남아 있는 `PARSE_FAILED` 행을 현재 파서로 다시 읽은 결과는 아래와 같습니다.
+
+| Run | `PARSE_FAILED` 원문 행 | 현재 파서로 읽힘 |
+| --- | --- | --- |
+| `R05_v8_261105`(v8, 2B) | 3,345 | 2,806 |
+| `R05_v8_8b_261106`(v8, 8B) | 1,274 | 99 |
+| `R11_v9_261113`(Gemini, 두 데이터셋) | 4 · 4 | 0 · 0 |
+| `R12_v10_261113`(Gemini, 두 데이터셋) | 1 · 2 | 0 · 0 |
+
+- v8 2B에서 새로 읽히는 2,806건 중 2,188건은 행동을 세미콜론으로 한 줄에 이은 출력입니다.
+- `--force` 없이 이 Run들을 다시 실행하면, 생성 전 재분류 단계에서 이 행들이 구조화 그래프로 바뀌고 재생성 대상에서 빠집니다.
+- 이렇게 복구된 그래프 중 일부는 target이 빠진 행동(`p1 - looking at p3; none; l1`)을 `looking at p3` / target `unknown`으로 읽습니다. 이름 형식에 적용하던 규칙을 ID 형식에도 똑같이 적용한 결과입니다.
+- 장면 파일이 다시 쓰이면 Graph 입력은 콘텐츠 해시로 연결되어 있어 다시 만들어질 것으로 보고, 입력 버전(`scene-bge-inputs/v4`)은 올리지 않았습니다. 이 동작은 따로 테스트하지 않았습니다.
+
+**검증.** `vc_cloud`에서 전체 테스트 38개와 `ruff check src tests`가 통과했습니다. lenient 전용 동작을 검사하던 테스트는 `PARSE_FAILED`를 기대하도록 바꿨습니다. ID 형식이 같은 복구를 받는지 확인하는 검사와, v8·v8_2·v9·v10 프롬프트의 모든 예시가 `native`로 파싱되는지 확인하는 검사를 추가했습니다.
+
+**미검증.** 실제 생성에서 `PARSE_FAILED`가 얼마나 늘어나는지, 그로 인한 재생성 비용은 확인하지 않았습니다. 이름 형식 소형 모델(v9_core·v10_core, 2B)의 원문은 남아 있지 않아서 lenient 제거의 영향을 측정하지 못했습니다. 새로 복구되는 v8 장면의 의미 정확도와 추천 성능 영향도 확인하지 않았습니다.
+
+### 2026-11-15: v8_2 역할 기반 ID(`actor_1` 등)와 place 용어 적용
+
+[scene_graph_v8_2](../prompts/scene_graph_v8_2.md)를 제자리에서 수정했습니다. v8_2로 생성한 Run이 없고 코드·설정에서 참조하지 않아 새 파일을 만들지 않았습니다. 사용자는 `p1`·`f1`·`t1`·`b1`처럼 의미를 알 수 없는 ID가 많이 쓰이는 것을 문제로 지적했습니다.
+
+**변경.**
+
+| | 이전 v8_2 | 현재 v8_2 |
+| --- | --- | --- |
+| ID | 짧은 임의 ID(`p1`, `f1`, `c1`, `l1`) | 첫 행동에서 맡는 역할 + 역할별 번호: `actor_1`, `target_1`, `tool_1`, `place_1`. 행동에 쓰이는 개체만 선언 |
+| 역할이 바뀌는 개체 | 해당 없음 | 첫 ID를 유지(예: `target_1`이 뒤 행동에서 actor가 될 수 있음) |
+| 장소 용어 | `location` | `place`(ID 접두어와 내부 필드명에 맞춤) |
+| 출력 형식 줄 | `actor - action - target; tool; location` | `actor_1 - action - target_1; tool_1; place_1` |
+| 예시 | 임의 ID | 같은 내용을 새 ID로 바꿈. 행동에 쓰이지 않던 도마는 삭제. 행동이 없는 메이크업 비교 예시는 Entities도 `none` |
+| 행동 없는 개체 | "Informative entities without actions are valid" | 삭제. "Declare only entities used in Actions"로 대체 |
+
+- `actor1`이 아니라 `actor_1`을 쓴 이유는 역할 이름과 번호가 눈에 띄게 구분되기 때문입니다(사용자와 논의). 파서 ID 정규식(`[\w.-]+`)은 두 형태 모두 받습니다.
+- "IDs cannot be none or unknown" 문장은 새 ID 규칙이 대신하므로 뺐습니다.
+- 처음에는 행동에 나오지 않는 개체를 `entity_1`로 쓰게 했으나, 사용자 결정에 따라 `entity_x`를 출력하지 않도록 이 규칙을 지웠습니다. 그 결과 행동이 없는 설명·비교·정적 장면에서는 엔티티 정보도 남지 않고 Context만 남습니다.
+
+**이 항목에서 함께 기록하는 v8 → v8_2 차이.** v8_2는 2026-11-13 커밋 `cc10463`에서 변경 이력 없이 추가됐으므로, 파일 diff로 확인한 내용을 여기에 남깁니다. 상한 확대(topics 3→4개·4→5단어, 엔티티 6→8, 속성 2→3, 행동 4→6), 구체적 kind·topics 요구, `-ing 동사 + 1~3단어` 행동 형식과 감정·강도 부사 금지, 자막·화면 숫자를 행동·속성 근거로 쓰지 않음, 역할 슬롯 자유 텍스트 금지, 같은 키프레임에 함께 나올 때만 actor–target 연결, 쉼표 대신 세미콜론, 예시 교체입니다. 당시 설계 의도는 기록이 없어 확인하지 못했습니다.
+
+**호환성.** 출력은 기존 ID 형식(v8)과 같은 구조이며 파서·스키마는 바꾸지 않았습니다. 세 예시를 `parse_or_repair_graph`에 넣어 모두 `native`로 파싱되고 ID·역할이 그대로 보존되는 것을 확인했습니다. 다만 엄격·복구 파싱이 모두 실패한 뒤의 lenient 경로에서, ID 형식을 거부하는 검사(`_ID_FORM_ROW`, `[A-Za-z]{1,3}\d+:`)가 `actor_1:`를 ID 형식으로 인식하지 못합니다. 이 경우 `actor_1 woman` 같은 이름 형식으로 잘못 읽힐 수 있으며, 아직 고치지 않았습니다.
+
+**미검증.** 실제 모델 생성은 하지 않았습니다. 모델이 역할 접두어를 지키는지, 첫 역할 기준 명명이 역할 혼동이나 파싱 실패를 늘리는지, 추천 성능에 영향이 있는지는 확인하지 않았습니다.
 
 ### 2026-11-13: TRASH_INFO 제거와 REPEAT_OCCURRED 추가 (`graph-text/v23`)
 

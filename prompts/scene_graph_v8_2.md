@@ -15,21 +15,22 @@ format: demonstration, explanation, review, narrative, highlights, performance, 
 Use unknown when uncertain and topics: none when no topic is supported. Topics describe this segment's specific subject, distinctive focus, or style, for example "Korean street food" rather than "food"; they are labels, not summaries or evidence of actions. Do not fill quotas.
 
 [Entities]
-- Include at most 8 important entities, including needed targets, tools, and places. Each has a unique short ID, kind, and up to 3 attributes of at most 6 words each. IDs cannot be none or unknown.
+- Include at most 8 important entities, including needed targets, tools, and places. Each has a unique ID, kind, and up to 3 attributes of at most 6 words each.
+- Name each ID by the role the entity takes in its first action, numbered from 1 per role: actor_1, actor_2, target_1, tool_1, place_1. Keep that ID when the entity takes another role in a later action.
 - Use the most specific visually supported kind, such as golden retriever, frying pan, or racing car, over person, food, vehicle, object, or thing. If only the subtype is unclear, keep the known broader kind.
 - For people, use visible distinguishing features such as age group, clothing, or gear as attributes; never invent professions or identities.
-- Attributes are visible colors, materials, states, sizes, or roles that distinguish the entity, and each attribute describes only its own entity. Do not invent details. Informative entities without actions are valid. Do not invent entities for topics, purposes, or aesthetics.
+- Attributes are visible colors, materials, states, sizes, or roles that distinguish the entity, and each attribute describes only its own entity. Do not invent details. Declare only entities used in Actions. Do not invent entities for topics, purposes, or aesthetics.
 
 [Actions]
 Select at most 6 distinct, supported actions. Write each action as a verb in -ing form followed by 1 to 3 words that make it specific: the visible manner, technique, direction, or body part, for example "slicing thinly", "kneading by hand", "speaking to camera", "holding up", or "drifting around a corner". Use a bare verb only when nothing more is visible. Never start an action with an adverb, adjective, or entity ID, and never add emotional or intensity adverbs such as emotionally, sharply, or emphatically. Roles are specific to each action:
 - actor: who or what performs the action.
 - target: what is acted on or transferred, not merely its holder. For transfers, keep the transferred object as target.
 - tool: the means actor actually uses for this action, not a nearby or merely held object. A knife is tool when cutting, target when washed.
-- location: where the action occurs, not its destination. Do not infer a kitchen from a knife or repeat the same location in attributes.
+- place: where the action occurs, not its destination. Do not infer a kitchen from a knife or repeat the same place in attributes.
 
 Each role is exactly one declared entity ID, none, or unknown, never a description such as "courtyard" or "beer mug". Declare a needed target, tool, or place as an entity first; otherwise write unknown:
 - none: the role is absent or inapplicable.
-- unknown: a relevant value cannot be identified or faithfully represented. The location default is unknown. Defaults are not observations.
+- unknown: a relevant value cannot be identified or faithfully represented. The place default is unknown. Defaults are not observations.
 - At least actor or target must reference a declared entity; unknown does not count. A visibly supported group can be one entity; otherwise use unknown for unrepresentable multiple participants, not ID lists or duplicate actions.
 - Link an actor to a target only when both appear in the same keyframe. If the action itself is uncertain, omit it. Empty actions are valid for explanations, comparisons, or static scenes. Never create links just to connect entities. Preserve supported order without inferring causality.
 
@@ -37,7 +38,7 @@ Each role is exactly one declared entity ID, none, or unknown, never a descripti
 Output [Context], [Entities], [Actions] in that order.
 Context: exactly three lines, medium: value, format: value, topics: value; value.
 Entities: id: kind; attribute; attribute. Omit unnecessary attributes.
-Actions: actor - action - target; tool; location. Write all five slots on one line; each role slot holds only a declared ID, none, or unknown, never empty or free text.
+Actions: actor_1 - action - target_1; tool_1; place_1. Write all five slots on one line; each role slot holds only a declared ID, none, or unknown, never empty or free text.
 Only space-dash-space ( - ) separates actor, action, and target. Do not use it inside fields; internal word hyphens are allowed. Semicolons separate topics, attributes, and the last two action slots; never join several topics or attributes with commas.
 Write none alone for empty Entities or Actions. No JSON, bullets, code fences, extra sections, or commentary. Stop after Actions. All limits are ceilings, not quotas.
 
@@ -50,12 +51,11 @@ medium: live_action
 format: demonstration
 topics: salmon sashimi preparation; knife slicing technique
 [Entities]
-p1: woman; striped apron; tied-back hair
-f1: salmon fillet; raw; skin removed
-t1: long slicing knife
-b1: wooden cutting board
+actor_1: woman; striped apron; tied-back hair
+target_1: salmon fillet; raw; skin removed
+tool_1: long slicing knife
 [Actions]
-p1 - slicing thinly - f1; t1; unknown
+actor_1 - slicing thinly - target_1; tool_1; unknown
 
 Gameplay in which a player-controlled red sports car drifts around a corner on a night city track while passing a blue car:
 [Context]
@@ -63,12 +63,12 @@ medium: gameplay
 format: highlights
 topics: street racing game; night city circuit; drifting
 [Entities]
-c1: sports car; red; player-controlled
-c2: sports car; blue
-l1: city race track; night; neon-lit buildings
+actor_1: sports car; red; player-controlled
+target_1: sports car; blue
+place_1: city race track; night; neon-lit buildings
 [Actions]
-c1 - drifting around a corner - none; none; l1
-c1 - overtaking on the outside - c2; none; l1
+actor_1 - drifting around a corner - none; none; place_1
+actor_1 - overtaking on the outside - target_1; none; place_1
 
 Close-ups compare heavy and light makeup on the same face; no application is shown:
 [Context]
@@ -76,6 +76,6 @@ medium: live_action
 format: explanation
 topics: low-contrast makeup; heavy versus light makeup
 [Entities]
-p1: person; low-contrast facial features; contrasting makeup looks
+none
 [Actions]
 none

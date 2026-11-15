@@ -88,14 +88,15 @@ def test_named_graph_parsing_and_repairs():
         ("e1", "leaving", "unknown", None, "unknown"),
         ("e2", "waiting", None, "e4", "unknown"),
     ]
-    # Pieces that cannot be told apart are dropped: a slot list, a leading orphan, a fourth part.
+    # Pieces that cannot be told apart fail: a slot list, a leading orphan, a fourth part.
     for loose in ("man1 - cutting - door; knife; room; door", "knife; man1 - cutting - door",
                   "man1 - cutting - door - room"):
-        assert actions(loose) == [("e2", "cutting", "e3", None, "unknown")]
+        assert parse_or_repair_graph(head + names + loose).warning == (PARSE_FAILED,), loose
 
-    # ID-form output keeps its earlier behavior.
-    legacy = head + "p1: woman\nf1: door\n[Actions]\np1 - pushing - f1; p1 - leaving - f1"
-    assert parse_or_repair_graph(legacy).warning == (PARSE_FAILED,)
+    # ID-form output takes the same repair.
+    legacy = parse_or_repair_graph(head + "p1: woman\nf1: door\n[Actions]\np1 - pushing - f1; p1 - leaving - f1")
+    assert legacy.parse_mode == "repaired" and [tuple(a.values()) for a in legacy.graph["actions"]] == [
+        ("p1", "pushing", "f1", None, "unknown"), ("p1", "leaving", "f1", None, "unknown")]
 
     # Labelled optional tool and place.
     head = ("[Context]\nmedium: animation\nformat: narrative\ntopics: dorm\n"
@@ -119,15 +120,14 @@ def test_named_graph_parsing_and_repairs():
                    "repaired") == [("e1", "cutting", "e2", "e3", "e4"), ("e1", "pushing", "e2", None, "unknown")]
     assert labelled("woman - cutting - door; tool: knife; woman - pushing - door; place: room", "repaired") == [
         ("e1", "cutting", "e2", "e3", "unknown"), ("e1", "pushing", "e2", None, "e4")]
-    # A repeated label keeps the first value; a slot beyond tool and place is dropped.
-    assert labelled("woman - cutting - door; tool: knife; tool: room", "repaired") == [
-        ("e1", "cutting", "e2", "e3", "unknown")]
-    assert labelled("woman - cutting - door; tool: knife; place: room; door", "repaired") == [
-        ("e1", "cutting", "e2", "e3", "e4")]
-    assert parse_or_repair_graph(head + "place: room").warning == (PARSE_FAILED,)
-    # ID-form output does not take labelled slots.
+    # A repeated label or a slot beyond tool and place fails.
+    for text in ("woman - cutting - door; tool: knife; tool: room",
+                 "woman - cutting - door; tool: knife; place: room; door", "place: room"):
+        assert parse_or_repair_graph(head + text).warning == (PARSE_FAILED,), text
+    # ID-form output also takes labelled slots.
     legacy = head.replace("woman\ndoor\nknife\nroom", "p1: woman\nf1: door\nt1: knife")
-    assert parse_or_repair_graph(legacy + "p1 - cutting - f1; tool: t1").warning == (PARSE_FAILED,)
+    parsed = parse_or_repair_graph(legacy + "p1 - cutting - f1; tool: t1")
+    assert parsed.parse_mode == "repaired" and parsed.graph["actions"][0]["tool"] == "t1"
 
     # A missing [Context] header and a stray none are repaired.
     body = "medium: animation\nformat: narrative\ntopics: dorm\n[Entities]\n{entities}\n[Actions]\n{actions}"
@@ -139,82 +139,69 @@ def test_named_graph_parsing_and_repairs():
     both = parse_or_repair_graph("medium: animation\nformat: narrative\ntopics: dorm\n"
                                  "woman; white blouse\ndoor\n[Actions]\nwoman - pushing - door; none; unknown")
     assert both.parse_mode == "repaired" and [e["name"] for e in both.graph["entities"]] == ["woman", "door"]
-    # ID-form output keeps its previous behaviour for both cases.
+    # ID-form output takes the same repairs.
     legacy = "p1: woman; white blouse\no1: door"
-    assert parse_or_repair_graph(body.format(entities=legacy, actions="none")).warning == (PARSE_FAILED,)
-    assert parse_or_repair_graph("[Context]\n" + body.format(
-        entities=legacy, actions="none\np1 - pushing - o1; none; unknown")).warning == (PARSE_FAILED,)
-    # A missing [Entities] header is read from the line shape.
+    parsed = parse_or_repair_graph(body.format(entities=legacy, actions="none"))
+    assert parsed.parse_mode == "repaired" and not parsed.warning and parsed.graph["medium"] == "animation"
+    parsed = parse_or_repair_graph("[Context]\n" + body.format(
+        entities=legacy, actions="none\np1 - pushing - o1; none; unknown"))
+    assert [tuple(a.values()) for a in parsed.graph["actions"]] == [("p1", "pushing", "o1", None, "unknown")]
+    # A missing [Entities] header after [Context] is inserted where the context lines end.
     parsed = parse_or_repair_graph("[Context]\nmedium: animation\nformat: narrative\ntopics: dorm\n"
                                    "woman\n[Actions]\nnone")
     assert not parsed.warning and [e["name"] for e in parsed.graph["entities"]] == ["woman"]
 
 
-LENIENT_HEAD = "[Context]\nmedium: live_action\nformat: narrative\ntopics: kitchen\n[Entities]\n"
+HEAD = "[Context]\nmedium: live_action\nformat: narrative\ntopics: kitchen\n[Entities]\n"
 
-
-LENIENT_CASES = [
+# Output whose sections or slots cannot be separated by the one repair pass fails.
+FAILED_CASES = [
+    "A man cooks pasta in a kitchen.",
     # Slot list after the target: tool and place cannot be told apart.
-    (LENIENT_HEAD + "woman\nman\n[Actions]\nwoman - speaking - man; man; door; car",
-     ["woman", "man"], [("woman", "speaking", "man", None, "unknown")]),
-    # No headers at all.
-    ("medium: animation\nformat: narrative\ntopics: duel\nman; brown hair\nsky\n"
-     "man - flying - none; none; sky",
-     ["man", "sky"], [("man", "flying", None, None, "sky")]),
-    # A place phrase after the target, and an action without spaces around its text.
-    (LENIENT_HEAD + "man\nfish\npit\n[Actions]\nman - placing - fish - into pit; none; pit\n"
-     "man -捞取- fish; none; unknown",
-     ["man", "fish", "pit"], [("man", "placing", "fish", None, "pit"), ("man", "捞取", "fish", None, "unknown")]),
-    # Reserved and colon names (also as roles), an unknown label, a time as a role, a second graph.
-    (LENIENT_HEAD + "man\nunknown; dark room\nmap: Greasy Grove\nclock\n[Actions]\n"
-     "man - pulling - map: Greasy Grove; target: chest\nclock - showing - 12:00; none; unknown\n"
-     "[Context]\nmedium: animation\nformat: narrative\ntopics: other\n[Entities]\ncat\n[Actions]\nnone",
-     ["man", "map Greasy Grove", "clock"],
-     [("man", "pulling", "map Greasy Grove", None, "unknown"), ("clock", "showing", "unknown", None, "unknown")]),
+    HEAD + "woman\nman\n[Actions]\nwoman - speaking - man; man; door; car",
+    # No [Entities] or [Actions] headers at all.
+    "medium: animation\nformat: narrative\ntopics: duel\nman; brown hair\nsky\nman - flying - none; none; sky",
+    # A fourth action part, and an action without spaces around its text.
+    HEAD + "man\nfish\npit\n[Actions]\nman - placing - fish - into pit; none; pit",
+    HEAD + "man\nfish\n[Actions]\nman -捞取- fish; none; unknown",
+    # Reserved entity names and labels other than tool and place.
+    HEAD + "unknown; dark room\n[Actions]\nnone",
+    HEAD + "man\nmap\n[Actions]\nman - pulling - map; target: chest",
     # One-line sections.
-    ("Context: animation; narrative; mountains\nEntities: mountain; cloud\nActions: none",
-     ["mountain", "cloud"], []),
-]
-
-TAGGED_CASES = [
-    ("A man cooks pasta in a kitchen.", PARSE_FAILED),
-    (LENIENT_HEAD.replace("topics: kitchen\n", "") + "man\n[Actions]\nnone", PARSE_FAILED),
-    (LENIENT_HEAD + "man\n[Actions]\nplace: kitchen", PARSE_FAILED),
-    (LENIENT_HEAD + "man", PARSE_FAILED),
-    # Without headers, the first none answers Entities and the second Actions.
-    ("medium: animation\nformat: narrative\ntopics: wolves\nwolf1; gray fur\nforest", PARSE_FAILED),
+    "Context: animation; narrative; mountains\nEntities: mountain; cloud\nActions: none",
+    # Missing context field, missing or empty sections.
+    HEAD.replace("topics: kitchen\n", "") + "man\n[Actions]\nnone",
+    HEAD + "man\n[Actions]\nplace: kitchen",
+    HEAD + "man",
+    "medium: animation\nformat: narrative\ntopics: wolves\nwolf1; gray fur\nforest",
 ]
 
 
-def test_lenient_parsing_warning_tags_and_prompt_examples():
+def test_failed_parsing_and_prompt_examples():
     from pathlib import Path
 
-    # Separable sections are kept.
-    for text, entities, actions in LENIENT_CASES:
+    for text in FAILED_CASES:
         parsed = parse_or_repair_graph(text)
-        assert parsed.error is None and not parsed.warning, (text, parsed.error)
-        names = {e["id"]: e["name"] for e in parsed.graph["entities"]}
-        assert [e["name"] for e in parsed.graph["entities"]] == entities, text
-        assert [tuple(names.get(v, v) for v in a.values()) for a in parsed.graph["actions"]] == actions, text
-    # Unseparable graphs are tagged.
-    for text, tag in TAGGED_CASES:
-        assert parse_or_repair_graph(text).warning == (tag,), text
-    # Graphs without informative values are no longer tagged (TRASH_INFO was removed).
-    for text in ("Context: unknown; unknown; unknown\nEntities: mountain; cloud\nActions: none",
-                 LENIENT_HEAD + "unknown\n[Actions]\nunknown - none - unknown; none; unknown",
-                 # Without headers, the first none answers Entities and the second Actions.
-                 "medium: animation\nformat: narrative\ntopics: city at dusk\nnone\nnone"):
-        parsed = parse_or_repair_graph(text)
-        assert parsed.graph is not None and not parsed.warning, text
-    # Every example in the current prompts parses natively.
-    for name in ("v9_core", "v9_extended", "v10_core", "v10_extended"):
+        assert parsed.graph is None and parsed.warning == (PARSE_FAILED,), text
+    # A second graph after the first is content after Actions.
+    assert parse_or_repair_graph(
+        HEAD + "cat\n[Actions]\nnone\n[Context]\nmedium: animation").warning == (PARSE_FAILED,)
+    # Every example in the ID-form (v8, v8_2) and name-form (v9, v10) prompts parses natively.
+    for name in ("v8", "v8_2", "v9_core", "v9_extended", "v10_core", "v10_extended"):
         text = (Path(__file__).parents[1] / "prompts" / f"scene_graph_{name}.md").read_text(encoding="utf-8")
         blocks = [block for block in text.split("\n\n") if "\n[Context]\nmedium: " in "\n" + block]
-        layout, *examples = [block[block.index("[Context]"):] for block in blocks]
-        assert "medium: value" in layout and len(examples) >= 3, name
+        examples = [block[block.index("[Context]"):] for block in blocks]
+        examples = [example for example in examples if "medium: value" not in example]
+        assert len(examples) >= 2, name
         for example in examples:
             parsed = parse_or_repair_graph(example)
             assert parsed.error is None and parsed.parse_mode == "native", (name, example, parsed.error)
+    # v8_2 role IDs are kept as declared.
+    parsed = parse_or_repair_graph(
+        HEAD + "actor_1: woman; apron\ntarget_1: salmon fillet\n[Actions]\n"
+        "actor_1 - slicing thinly - target_1; none; unknown")
+    assert [e["id"] for e in parsed.graph["entities"]] == ["actor_1", "target_1"]
+    assert parsed.graph["actions"][0]["actor"] == "actor_1"
 
 
 def test_scene_storage_resume_and_progress(context, tmp_path):
@@ -453,7 +440,7 @@ def test_truncated_scenes_are_token_limit_warnings_and_regenerate(context, monke
     rows = read_jsonl(path)
     rows[0] = {"content_id": path.stem, "scene_idx": rows[0]["scene_idx"], "tokens": 384,
                "error": "graph: output truncated at token limit", "raw_output": LOOPED_GRAPH_TEXT}
-    headless = "medium: animation\nformat: narrative\ntopics: duel\nman\nsky\nman - flying - none; none; sky"
+    headless = "medium: animation\nformat: narrative\ntopics: duel\nman\nsky\n[Actions]\nman - flying - none; none; sky"
     rows[-1] = {**rows[-1], "warning": ["MISSING_REQUIRED"], "scene_graph": headless}
     atomic_write_jsonl(path, rows, durable=True, sort_keys=False)
     generator.tasks.clear()
