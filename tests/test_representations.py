@@ -1,5 +1,4 @@
 from copy import deepcopy
-import json
 
 import numpy as np
 import pytest
@@ -56,13 +55,13 @@ def _check_v8_location_reaches_embeddings_and_segments_without_source_rewrite(co
         value = row["scene_graph"]
         for action in value["actions"]:
             action["location"] = action.pop("place")
-        row["scene_graph"] = json.dumps(value)
+        row["scene_graph"] = value  # v8 rows are stored as structured graphs
     write_jsonl(path, rows)
     before = (path.read_bytes(), path.stat().st_mtime_ns)
     assert source_identity(context, cohort, arm) != identity_before
     assert all(not row["semantic_warnings"] for row in read_scene_records(path))
 
-    # Reproduce a v1 cache that excluded the same JSON source before compatibility.
+    # Reproduce a v1 cache that excluded the same location source before compatibility.
     with monkeypatch.context() as old_runtime:
         old_runtime.setattr("validation.graph_inputs.VERSION", "scene-bge-inputs/v1")
         old_runtime.setattr(

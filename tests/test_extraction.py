@@ -161,9 +161,12 @@ FAILED_CASES = [
     HEAD + "woman\nman\n[Actions]\nwoman - speaking - man; man; door; car",
     # No [Entities] or [Actions] headers at all.
     "medium: animation\nformat: narrative\ntopics: duel\nman; brown hair\nsky\nman - flying - none; none; sky",
-    # A fourth action part, and an action without spaces around its text.
+    # A fourth action part, and dashes with no space on either side (word hyphens).
     HEAD + "man\nfish\npit\n[Actions]\nman - placing - fish - into pit; none; pit",
-    HEAD + "man\nfish\n[Actions]\nman -捞取- fish; none; unknown",
+    HEAD + "man\nfish\n[Actions]\nman-catching-fish; none; unknown",
+    # JSON output and an [End] section are not part of the v8-v10 prompts.
+    '{"medium": "live_action", "format": "other", "topics": [], "entities": [], "actions": []}',
+    HEAD + "man\n[Actions]\nnone\n[End]",
     # Reserved entity names and labels other than tool and place.
     HEAD + "unknown; dark room\n[Actions]\nnone",
     HEAD + "man\nmap\n[Actions]\nman - pulling - map; target: chest",
@@ -196,6 +199,13 @@ def test_failed_parsing_and_prompt_examples():
         for example in examples:
             parsed = parse_or_repair_graph(example)
             assert parsed.error is None and parsed.parse_mode == "native", (name, example, parsed.error)
+    # A dash with a space on only one side still separates; word hyphens stay inside fields.
+    for text in ("man -catching- fish; none; unknown", "man- catching -fish; none; unknown"):
+        parsed = parse_or_repair_graph(HEAD + "man; t-shirt\nfish\n[Actions]\n" + text)
+        assert parsed.parse_mode == "repaired" and parsed.graph["actions"][0]["action"] == "catching", text
+        assert parsed.graph["entities"][0]["attributes"] == ["t-shirt"]
+    parsed = parse_or_repair_graph(HEAD + "p1: man\nf1: fish\n[Actions]\np1 -hand-washing- f1; none; unknown")
+    assert parsed.graph["actions"][0]["action"] == "hand-washing"
     # v8_2 role IDs are kept as declared.
     parsed = parse_or_repair_graph(
         HEAD + "actor_1: woman; apron\ntarget_1: salmon fillet\n[Actions]\n"

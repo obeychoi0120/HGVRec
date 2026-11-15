@@ -10,7 +10,51 @@
 
 대상(최신순): [v10_extended](../prompts/scene_graph_v10_extended.md) · [v10_core](../prompts/scene_graph_v10_core.md) → [v9_extended](../prompts/scene_graph_v9_extended.md) · [v9_core](../prompts/scene_graph_v9_core.md) → [v9(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v9.md) → [v8_2](../prompts/scene_graph_v8_2.md) → [v8](../prompts/scene_graph_v8.md) → [v7](../prompts/scene_graph_v7.md) → [v6](../prompts/scene_graph_v6.md) → [v5](../prompts/scene_graph_v5.md) → [v4](../prompts/scene_graph_v4.md)
 
-**개선 흐름: 콘텐츠 맥락과 행동을 분리 → 같은 주제 안의 차별점 보존 → 행동별 역할과 불확실성 명확화 → receiver 제거로 역할 구분 부담 축소 → 이름 직접 참조와 모델 크기별 프롬프트 분리 → 규칙 문장 간소화(v10, 효과 미검증) → tool·place 라벨화와 줄 배치 템플릿(v9·v10, 효과 미검증) → 행동 반복 방지 규칙(v9·v10, 효과 미검증).**
+**개선 흐름: 콘텐츠 맥락과 행동을 분리 → 같은 주제 안의 차별점 보존 → 행동별 역할과 불확실성 명확화 → receiver 제거로 역할 구분 부담 축소 → 이름 직접 참조와 모델 크기별 프롬프트 분리 → 규칙 문장 간소화(v10, 효과 미검증) → tool·place 라벨화와 줄 배치 템플릿(v9·v10, 효과 미검증) → 행동 반복 방지 규칙(v9·v10, 효과 미검증) → v10 tool·place 라벨 제거와 고정 두 칸(효과 미검증).**
+
+### 2026-11-15: v10 tool·place 라벨 제거(`; tool; place` 고정 두 칸)
+
+[v10_core](../prompts/scene_graph_v10_core.md)와 [v10_extended](../prompts/scene_graph_v10_extended.md)를 제자리에서 수정했습니다. 사용자 요청으로 행동 줄의 `tool:`·`place:` 라벨을 없앴습니다. v9는 바꾸지 않았습니다. extended가 core 전문으로 시작하는 구조는 그대로입니다.
+
+**변경.**
+
+| | 이전 v10 | 현재 v10 |
+| --- | --- | --- |
+| 행동 줄 | `actor - action - target; tool: name; place: name` | `actor - action - target; tool; place` |
+| 빈 칸 | 보일 때만 `tool:`·`place:`를 붙이고 아니면 칸을 생략 | 두 칸을 항상 씀. 도구가 없으면 tool은 `none`, 구체적 장소가 안 보이면 place는 `unknown` |
+| 규칙 문장 | "Add tool: and then place: only when the frames show them … Otherwise leave the slot out." | "tool and place are names copied exactly from [Entities]. Write none for tool … unknown for place … Every action line has both slots." |
+| 예시 | 라벨 형식, 칸 생략 | 같은 내용을 위치 형식으로 바꿈(core 3줄, extended 추가 예시 4줄). 예: `man2 - carrying - wooden board; none; unknown` |
+
+**설계 의도.** 라벨이 없으면 칸을 위치로만 구분합니다. 칸 생략을 허용하면 `chef - cutting - fish; kitchen`의 `kitchen`을 tool로 읽게 되므로, 사용자 결정에 따라 두 칸을 항상 쓰게 했습니다. 이 형식은 v8의 다섯 칸 형식과 같고, v10의 이름 직접 참조는 유지합니다.
+
+**호환성.** 파서는 바꾸지 않았습니다. 이름 형식에서 라벨 없는 세 구간(`body; tool; place`)은 기존에도 strict 단계에서 `native`로 읽히고, 라벨 형식도 v9를 위해 그대로 읽습니다. 두 v10 프롬프트의 해시가 바뀌므로, 이전 v10으로 생성한 `R12_v10_261113`(Gemini)과는 다른 프롬프트입니다.
+
+**검증한 것.** 두 파일의 모든 예시가 `native`로 파싱되는지와 extended가 core로 시작하는지를 기존 테스트로 확인했습니다.
+
+**미검증.** 이 프롬프트로는 생성하지 않았습니다. 모델이 두 칸을 항상 채우는지, `none`·`unknown` 선택에서 실수가 늘어나는지, 칸 생략보다 출력 토큰이 늘어 절단이 늘어나는지, 추천 성능에 영향이 있는지는 확인하지 않았습니다.
+
+### 2026-11-15: v8~v10에 없는 파싱 경로 제거와 한쪽 공백 구분자 복구 (`graph-text/v25`)
+
+프롬프트 파일은 변경하지 않았습니다. 사용자 결정에 따라 현재 프롬프트(v8·v8_2·v9·v10)에 해당하지 않는 파싱 경로를 지우고, 공백이 한쪽에만 있는 행동 구분자를 복구합니다.
+
+**제거.**
+
+| 경로 | 쓰던 버전 | 처리 |
+| --- | --- | --- |
+| 모델 출력 JSON 파싱·복구(`semantic_graph/json_repair.py`) | v8~v10에는 없음. 네 프롬프트 모두 "No JSON"을 지시 | 파일 삭제. `{`로 시작하는 출력은 `PARSE_FAILED` |
+| `[End]` 섹션 | v3·v4 | 헤더로 인정하지 않음. `[End]` 줄은 `PARSE_FAILED` |
+
+- 저장된 v8~v10 Run의 원문(실패·절단 행)을 확인했습니다. `R05_v8_261105` 4,605행, `R05_v8_8b_261106` 1,274행, `R11_v9_261113` 358행, `R12_v10_261113` 317행 중 JSON으로 시작하거나 `[End]`가 들어 있는 행은 없었습니다.
+- 저장된 구조화 그래프의 v8 `location` → `place` 정규화(`normalize_graph_fields`)는 JSON 문자열 파싱과 별개의 v8 호환이므로 유지합니다. 이 호환을 검사하던 테스트는 행을 JSON 문자열로 만들어 쓰고 있었습니다. 실제 저장 형식과 같은 딕셔너리로 바꿨습니다(`R05_v8_261105`의 Action에 `location` 필드가 있는 행은 0건).
+- 코드 펜스·글머리표·헤더 표기 변형·전각 구분자 복구는 특정 버전의 형식이 아니라 모델의 형식 실수를 복구하는 것이므로 유지했습니다.
+
+**추가.** 행동 구분자로, 앞뒤 중 한쪽에만 공백이 있는 `-`·`–`·`—`도 인정합니다. 예: `man -捞取- fish`, `p1 -被打 - p2`. 양쪽에 공백이 없는 하이픈(`t-shirt`, `hand-washing`)은 단어 안의 하이픈으로 보고 구분자로 쓰지 않습니다.
+
+**저장된 Run에 미치는 영향(읽기 전용).** 원문이 남은 `PARSE_FAILED` 행 중 현재 파서로 읽히는 행이 `R05_v8_261105`에서 2,806 → 2,826건, `R05_v8_8b_261106`에서 99 → 113건으로 늘었습니다. 새로 읽히는 행 표본은 대부분 행동이 중국어 동사인 출력(`p1 -掏出- t1`)이었습니다. 구조는 복구되지만 영어로 쓰라는 프롬프트 지시는 지켜지지 않은 출력입니다. Gemini v9·v10 Run은 변화가 없습니다.
+
+**검증.** `vc_cloud`에서 전체 테스트 38개와 `ruff check src tests`가 통과했습니다. JSON 출력과 `[End]` 출력이 `PARSE_FAILED`가 되는지, 한쪽 공백 구분자가 복구되는지, 단어 하이픈은 유지되는지 확인하는 검사를 추가했습니다.
+
+**미검증.** 한쪽 공백 규칙이 장소·도구 이름 안의 하이픈(예: `pre -war house`)을 구분자로 잘못 읽는 경우가 실제로 얼마나 생기는지는 확인하지 않았습니다. 중국어 행동이 들어간 장면이 추천 입력에 주는 영향도 확인하지 않았습니다.
 
 ### 2026-11-15: lenient 경로 제거와 ID·이름 형식 공통 복구 (`graph-text/v24`)
 

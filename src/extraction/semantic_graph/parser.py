@@ -7,25 +7,31 @@ delimiters and missing headers without inventing content. Anything else fails.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from typing import Any
 
 from extraction.graph_warnings import PARSE_FAILED
 from extraction.structured_output import OutputValidationError, normalize_graph_references
 
-from extraction.semantic_graph.json_repair import (
-    GraphParseResult,
-    parse_or_repair_graph as parse_json_graph,
-)
-
-GRAPH_PARSER_VERSION = "graph-text/v24"
-_SECTIONS = ("Context", "Entities", "Actions", "End")
+GRAPH_PARSER_VERSION = "graph-text/v25"
+_SECTIONS = ("Context", "Entities", "Actions")
 _ID = re.compile(r"[\w.-]+")
 _BULLET = re.compile(r"^(?:[-*•]\s+|\d+[.)]\s+)")
-_DELIMITER = re.compile(r"-+>|=+>|→|⇒|－＞|(?<=\s)[-–—](?=\s)")
+# A dash with a space on at least one side separates; word hyphens (t-shirt) have none.
+_DELIMITER = re.compile(r"-+>|=+>|→|⇒|－＞|(?<=\s)[-–—]|[-–—](?=\s)")
 _ACTION_MARK = re.compile(r"[<>=→⇒←↔⇐⟵⟷⟺－＞]|(?<=\s)[-–—](?=\s)")
 # Name-form tool and place slots are labelled and optional; these are the values of an omitted slot.
 _SLOT_DEFAULTS = {"tool": "none", "place": "unknown"}
 _SLOT = re.compile(r"(tool|place):\s*(.*)")
 _LOOSE_SLOT = re.compile(r"(tool|place)\s*[:：]\s*(.*)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class GraphParseResult:
+    graph: dict[str, Any] | None
+    error: str | None = None
+    parse_mode: str | None = None
+    warning: tuple[str, ...] = ()
 
 
 class GraphTextError(ValueError):
@@ -38,9 +44,9 @@ def _header(line, *, repair):
     if not repair:
         return next((name for name in _SECTIONS if line == f"[{name}]"), None)
     match = re.fullmatch(
-        r"(?:\[\s*(entities|context|actions|end)\s*\]"
-        r"|(entities|context|actions|end)\s*[:：]"
-        r"|#{1,6}\s+(entities|context|actions|end)\s*[:：]?)",
+        r"(?:\[\s*(entities|context|actions)\s*\]"
+        r"|(entities|context|actions)\s*[:：]"
+        r"|#{1,6}\s+(entities|context|actions)\s*[:：]?)",
         line,
         re.IGNORECASE,
     )
@@ -194,14 +200,12 @@ def _parse_context_actions(text, *, repair):
     if missing:
         raise GraphTextError(f"missing [{missing[0]}]")
     text = "\n".join(lines)
-    order = (*required, "End")
+    order = required
     sections, current, seen = {}, None, 0
     for number, source in enumerate(text.splitlines(), 1):
         line = source.strip()
         if not line:
             continue
-        if current == "End":
-            raise GraphTextError(f"line {number}: content after [End]")
         if repair:
             line = _BULLET.sub("", line, count=1)
         header = _header(line, repair=repair)
@@ -282,12 +286,6 @@ def parse_or_repair_graph(text: str) -> GraphParseResult:
         return GraphParseResult(None, error="empty VLM output", warning=(PARSE_FAILED,))
     try:
         unwrapped = _unwrap(raw)
-        if unwrapped.startswith("{"):
-            parsed = parse_json_graph(unwrapped)
-            if parsed.graph is None:
-                return parsed
-            mode = "repaired" if unwrapped != raw.strip() else parsed.parse_mode
-            return _validated_graph(parsed.graph, mode)
         try:
             graph, named = _parse_context_actions(raw, repair=False)
             mode = "native"

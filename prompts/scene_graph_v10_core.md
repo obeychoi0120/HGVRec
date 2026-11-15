@@ -17,10 +17,10 @@ Up to 6 entities: the main participants and the targets and tools their actions 
 - Add a place only when the frames show a specific location, such as kitchen.
 
 [Actions]
-Up to 4 actions, one per line: actor - action - target; tool: name; place: name.
+Up to 4 actions, one per line: actor - action - target; tool; place.
 - actor performs the action. target is who or what it is done to. tool is what the actor uses. place is the specific location.
 - actor and target are names copied exactly from [Entities], or unknown. Write none when there is no target.
-- Add tool: and then place: only when the frames show them, each with a name copied exactly from [Entities]. Otherwise leave the slot out.
+- tool and place are names copied exactly from [Entities]. Write none for tool when no tool is used and unknown for place when no specific location is visible. Every action line has both slots.
 - Write what someone does to an object or to another participant. Posture and expression are attributes, not actions.
 - The action is a verb phrase without entity names: woman - pointing at - dish.
 - Write each action once; every line differs from all earlier lines. Write a shared action such as talking once, not once per participant.
@@ -36,7 +36,7 @@ topics: value; value
 [Entities]
 name; attribute; attribute
 [Actions]
-actor - action - target; tool: name; place: name
+actor - action - target; tool; place
 
 Start a new line after every section header, every context field, every entity, and every action. Never put two fields, two entities, or two actions on one line.
 Separate topics, attributes, and the tool and place slots with semicolons. Use space-dash-space ( - ) only between actor, action, and target. No colons or IDs in entity lines.
@@ -56,7 +56,7 @@ sea urchin
 knife
 kitchen
 [Actions]
-chef - cutting - sea urchin; tool: knife; place: kitchen
+chef - cutting - sea urchin; knife; kitchen
 
 Two men are in an unclear place; one sands a wooden board with a sanding block, then the other carries the board away:
 [Context]
@@ -69,8 +69,8 @@ man2; wearing cap
 wooden board
 sanding block
 [Actions]
-man1 - sanding - wooden board; tool: sanding block
-man2 - carrying - wooden board
+man1 - sanding - wooden board; sanding block; unknown
+man2 - carrying - wooden board; none; unknown
 
 Close-ups compare heavy and light makeup on the same face; no application is shown:
 [Context]
