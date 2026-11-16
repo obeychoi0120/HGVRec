@@ -136,6 +136,7 @@ def make_context(root, lengths=(5, 6, 13)):
     }
     for name, directory, kind, architecture in (
         ("qwen3vl_2b", "Qwen3-VL-2B-Instruct", "qwen3_vl", "Qwen3VLForConditionalGeneration"),
+        ("qwen3vl_4b", "Qwen3-VL-4B-Instruct", "qwen3_vl", "Qwen3VLForConditionalGeneration"),
         ("qwen3vl_8b", "Qwen3-VL-8B-Instruct", "qwen3_vl", "Qwen3VLForConditionalGeneration"),
         ("bge", "bge", "bert", "BertModel"),
     ):

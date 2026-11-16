@@ -140,6 +140,64 @@ def test_qwen_identity_sizes_and_prompts(context):
         prompt_provenance(context, "prompts/scene_graph_v9_extended.md", large)
 
 
+def test_qwen3vl_4b_source_and_checkpoint(context, monkeypatch):
+    from arm_registry import generated_arm, resolve_generation_arm
+    from extraction import cli
+    from extraction.qwen_config import QWEN_MODELS, generation_settings, validate_checkpoint
+    from extraction.steps import GRAPH_SOURCES, LOCAL_MODELS
+    from pipeline_runtime import require_generation_config
+
+    # 4B is a third local size beside 2B and 8B with its own sources and directories.
+    assert QWEN_MODELS == ("qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b")
+    assert "qwen3vl_4b" in LOCAL_MODELS and "qwen3vl_4b" in GRAPH_SOURCES
+    sources = generation_registry(context.config)
+    for prefix, kind in (("graph", "graph"), ("desc", "description")):
+        arm = sources[f"{prefix}_qwen3vl_4b"]
+        assert (arm.representation, arm.model, arm.scene_arm, arm.uses_title) == (
+            kind, "qwen3vl_4b", f"{prefix}_qwen3vl_4b", False)
+        assert generated_arm(context.config, kind, "qwen3vl_4b") == arm
+        assert resolve_generation_arm(context.config, arm.name, kind, "qwen3vl_4b") == arm
+        with pytest.raises(ValueError, match="requested extraction model"):
+            resolve_generation_arm(context.config, arm.name, kind, "qwen3vl_8b")
+        require_generation_config(context.config, kind, "qwen3vl_4b")
+        assert context.extraction_dir(kind, "qwen3vl_4b", "scenes") == context.scene_arm_dir(arm.name)
+    assert len({context.scene_arm_dir(f"graph_qwen3vl_{s}") for s in ("2b", "4b", "8b")}) == 3
+    calls = []
+    monkeypatch.setattr(cli.RunContext, "load", lambda *a, **k: context)
+    for step in ("extract-graph-scenes", "extract-description-scenes"):
+        monkeypatch.setitem(cli.STEP_HANDLERS, step, lambda ctx, **options: calls.append(options) or {})
+    base = ["--run-id", "r", "--dataset", "microlens_100k", "--model", "qwen3vl_4b"]
+    assert cli.main(["extract-graph-scenes", *base, "--schema", "prompts/scene_graph_v9_core.md",
+                     "--arm", "graph_qwen3vl_4b", "--repetition-penalty", "1.05",
+                     "--stop-repeated-lines"]) == 0
+    assert cli.main(["extract-description-scenes", *base,
+                     "--schema", "prompts/scene_description_v3.md"]) == 0
+    assert [(c["model"], c["arm"]) for c in calls] == [("qwen3vl_4b", "graph_qwen3vl_4b"), ("qwen3vl_4b", None)]
+
+    # Generation settings match the other sizes except for the recorded model key.
+    for representation in ("graph", "description"):
+        small = generation_settings("qwen3vl_2b", representation=representation)
+        middle = generation_settings("qwen3vl_4b", representation=representation)
+        assert {**middle, "model": "qwen3vl_2b"} == small and middle["model"] == "qwen3vl_4b"
+
+    identity = prompt_provenance(context, "prompts/scene_graph_v9_core.md", sources["graph_qwen3vl_4b"])
+    assert identity["scene_arm"] == "graph_qwen3vl_4b"
+    assert identity["settings"]["generation"]["model"] == "qwen3vl_4b"
+    assert identity["model"]["path"] != prompt_provenance(
+        context, "prompts/scene_graph_v9_core.md", sources["graph_qwen3vl_2b"])["model"]["path"]
+
+    # A checkpoint whose name states another size is rejected in both directions.
+    config = read_json(context.path("models", "qwen3vl_4b") / "config.json")
+    validate_checkpoint("qwen3vl_4b", config, context.path("models", "qwen3vl_4b"))
+    with pytest.raises(ValueError, match="expects 4B, but the checkpoint name states 2B"):
+        validate_checkpoint("qwen3vl_4b", config, context.path("models", "qwen3vl_2b"))
+    with pytest.raises(ValueError, match="expects 8B, but the checkpoint name states 4B"):
+        validate_checkpoint("qwen3vl_8b", config, context.path("models", "qwen3vl_4b"))
+    with pytest.raises(ValueError, match="expects 4B"):
+        context.config["models"]["qwen3vl_4b"] = context.config["models"]["qwen3vl_8b"]
+        prompt_provenance(context, "prompts/scene_graph_v9_core.md", sources["graph_qwen3vl_4b"])
+
+
 @pytest.mark.torch
 def test_stop_before_repeated_line(monkeypatch):
     import numpy as np

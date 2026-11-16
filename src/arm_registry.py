@@ -21,7 +21,7 @@ class Arm:
     segments: tuple[str, int] | None = None
 
 
-GENERATION_MODELS = ("qwen3vl_2b", "qwen3vl_8b", "gemini")
+GENERATION_MODELS = ("qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "gemini")
 SOURCES = tuple(
     Arm(f"{prefix}_{model}", kind, model, False, f"{prefix}_{model}")
     for model in GENERATION_MODELS

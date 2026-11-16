@@ -7,10 +7,12 @@ protocol:
   catalog_scope: retained_sequence_catalog
   graph_extractors:
   - qwen3vl_2b
+  - qwen3vl_4b
   - qwen3vl_8b
   - gemini
   description_extractors:
   - qwen3vl_2b
+  - qwen3vl_4b
   - qwen3vl_8b
   - gemini
 artifacts_root: artifacts
@@ -35,6 +37,7 @@ datasets:
       item_count: 9031
 models:
   qwen3vl_2b: /home_nvme/shared/models/Qwen3-VL-2B-Instruct
+  qwen3vl_4b: /home_nvme/shared/models/Qwen3-VL-4B-Instruct
   qwen3vl_8b: /home_nvme/shared/models/Qwen3-VL-8B-Instruct
   bge: /home_nvme/shared/models/bge-large-en-v1.5
   gemini:
@@ -66,12 +69,16 @@ extraction:
   description:
     qwen3vl_2b:
       scene_max_new_tokens: 448
+    qwen3vl_4b:
+      scene_max_new_tokens: 448
     qwen3vl_8b:
       scene_max_new_tokens: 448
     gemini:
       scene_max_new_tokens: 1024
   graph:
     qwen3vl_2b:
+      scene_max_new_tokens: 512
+    qwen3vl_4b:
       scene_max_new_tokens: 512
     qwen3vl_8b:
       scene_max_new_tokens: 512

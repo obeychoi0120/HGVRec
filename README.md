@@ -49,7 +49,7 @@ experiments:
 | `version` | `1` |
 | `defaults.readout` | 선택 항목. 생략하면 `mean`. 공통 `source`는 허용하지 않습니다. |
 | `experiments[].label` | 필수 사용자 지정 이름. 소문자 영문으로 시작하고 영문 소문자·숫자·하이픈만 사용하며 중복은 허용하지 않습니다. 모델 구조를 결정하지 않습니다. |
-| `experiments[].source` | 각 실험에 필수. `metadata`, `graph_qwen3vl_2b`, `desc_qwen3vl_2b`, `graph_qwen3vl_8b`, `desc_qwen3vl_8b`, `graph_gemini`, `desc_gemini` 중 선택합니다. |
+| `experiments[].source` | 각 실험에 필수. `metadata`, `graph_qwen3vl_2b`, `desc_qwen3vl_2b`, `graph_qwen3vl_4b`, `desc_qwen3vl_4b`, `graph_qwen3vl_8b`, `desc_qwen3vl_8b`, `graph_gemini`, `desc_gemini` 중 선택합니다. |
 | `experiments[].modules` | 생략하면 `[]`. Graph source에서 `REAF`(role_fusion), `GNN_ATTN`(scene_attention), `ASHA`(activity_hypergraph)를 단독 또는 함께 사용할 수 있습니다. 결과 identity에는 괄호 안의 내부 이름이 기록되며, 내부 이름도 설정에서 계속 읽습니다. 단계 로그와 보고서에는 설정 이름(`REAF`, `GNN_ATTN`, `ASHA`)으로 표시합니다. |
 | `experiments[].readout` | 개별 값 → 공통값 → `mean` 순서로 적용합니다. 현재 `mean`만 지원합니다. |
 | `experiments[].segments` | 선택 항목. `ASHA`가 있는 실험에서만 허용합니다. 생략하면 기본 활동 구간을 사용하고 기존 결과 identity가 바뀌지 않습니다. `action_bag`, `time_window`, `random` 중 하나를 지정하면 모델 구조는 같고 장면–구간 소속만 바꾼 ablation이 됩니다. 아래 표를 참고하세요. |
@@ -92,7 +92,7 @@ python -m pip install -e ".[train,embedding,dev]"
 python -m pip check
 ```
 
-Qwen 장면 추출 환경에는 `python -m pip install -e ".[qwen,dev]"`를 추가로 실행합니다. Linux/CUDA와 Qwen3-VL-2B-Instruct의 비양자화 BF16 checkpoint를 사용합니다. Gemini는 `python -m pip install -e ".[gemini,dev]"`로 설치하고 Vertex 프로젝트·위치·모델, ADC 인증·호출 권한을 설정합니다. 추출 환경과 임베딩·추천 환경은 분리할 수 있습니다.
+Qwen 장면 추출 환경에는 `python -m pip install -e ".[qwen,dev]"`를 추가로 실행합니다. Linux/CUDA와 Qwen3-VL-2B·4B·8B-Instruct의 비양자화 BF16 checkpoint를 사용합니다. Gemini는 `python -m pip install -e ".[gemini,dev]"`로 설치하고 Vertex 프로젝트·위치·모델, ADC 인증·호출 권한을 설정합니다. 추출 환경과 임베딩·추천 환경은 분리할 수 있습니다.
 
 | 설정 파일 | 역할 |
 | --- | --- |
@@ -104,10 +104,10 @@ Qwen 장면 추출 환경에는 `python -m pip install -e ".[qwen,dev]"`를 추�
 | 설정 키 | 확인할 내용 |
 | --- | --- |
 | `datasets.<dataset>.data`, `datasets.<dataset>.source_counts` | 원본 데이터 경로와 검증할 개수 |
-| `models.qwen3vl_2b`, `models.qwen3vl_8b`, `models.bge`, `models.gemini` | 필요한 로컬 가중치 또는 Gemini 호출 설정. Qwen 경로의 폴더 이름에는 해당 크기(`2B`·`8B`)가 들어 있어야 합니다. |
+| `models.qwen3vl_2b`, `models.qwen3vl_4b`, `models.qwen3vl_8b`, `models.bge`, `models.gemini` | 필요한 로컬 가중치 또는 Gemini 호출 설정. Qwen 경로의 폴더 이름에는 해당 크기(`2B`·`4B`·`8B`)가 들어 있어야 합니다. |
 | `extraction.visual_evidence` | 시간 창·키프레임 수·해상도 |
 | `extraction.qwen`, `extraction.gemini` | 추론 엔진·동시 실행 설정 |
-| `extraction.{graph,description}.{qwen3vl_2b,qwen3vl_8b,gemini}` | 장면 출력 토큰 한도 |
+| `extraction.{graph,description}.{qwen3vl_2b,qwen3vl_4b,qwen3vl_8b,gemini}` | 장면 출력 토큰 한도 |
 | `validation.cohort`, `validation.encoder` | 사용자 이력 처리와 BGE 인코딩 |
 | `validation.model`, `validation.evaluation` | seed·학습·결정적 연산·평가·통계 설정 |
 | `validation.graph_execution` | 특징 캐시·chunk·checkpoint 실행 설정 |
@@ -141,6 +141,7 @@ YAML에서 사용하는 서로 다른 시각 source만 준비합니다. 추출 �
 
 ```bash
 python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_core.md --model qwen3vl_2b --arm graph_qwen3vl_2b
+python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_core.md --model qwen3vl_4b --arm graph_qwen3vl_4b
 python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_extended.md --model qwen3vl_8b --arm graph_qwen3vl_8b
 python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_description_v3.md --model qwen3vl_2b --arm desc_qwen3vl_2b
 ```
@@ -150,6 +151,8 @@ python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$D
 | `metadata` | 필요 없음 | — | — |
 | `graph_qwen3vl_2b` | `extract-graph-scenes` | `qwen3vl_2b` | `graph_qwen3vl_2b` |
 | `desc_qwen3vl_2b` | `extract-description-scenes` | `qwen3vl_2b` | `desc_qwen3vl_2b` |
+| `graph_qwen3vl_4b` | `extract-graph-scenes` | `qwen3vl_4b` | `graph_qwen3vl_4b` |
+| `desc_qwen3vl_4b` | `extract-description-scenes` | `qwen3vl_4b` | `desc_qwen3vl_4b` |
 | `graph_qwen3vl_8b` | `extract-graph-scenes` | `qwen3vl_8b` | `graph_qwen3vl_8b` |
 | `desc_qwen3vl_8b` | `extract-description-scenes` | `qwen3vl_8b` | `desc_qwen3vl_8b` |
 | `graph_gemini` | `extract-graph-scenes` | `gemini` | `graph_gemini` |

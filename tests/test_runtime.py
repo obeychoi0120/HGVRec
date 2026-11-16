@@ -17,15 +17,15 @@ def test_config_loading_and_validation(context):
     assert settings.model.max_sequence_length == 10
     assert context.run_root == context.root / "artifacts" / "runs" / "regression" / "microlens_100k"
     paths = [context.path("data", key) for key in context.data]
-    paths += [context.path("models", key) for key in ("qwen3vl_2b", "qwen3vl_8b", "bge")]
+    paths += [context.path("models", key) for key in ("qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "bge")]
     assert all(path.is_relative_to(context.root) for path in paths)
     assert not any(str(path).startswith("/home_nvme") for path in paths)
     assert Path(settings.dataset.pairs_csv).is_file()
 
     config = deepcopy(context.config)
     config.pop("_rec_experiments")
-    config["protocol"]["graph_extractors"] = ["qwen3vl_2b", "qwen3vl_8b", "gemini"]
-    config["protocol"]["description_extractors"] = ["qwen3vl_2b", "qwen3vl_8b", "gemini"]
+    config["protocol"]["graph_extractors"] = ["qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "gemini"]
+    config["protocol"]["description_extractors"] = ["qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "gemini"]
     _validate_config(config)
 
     # Per-Run analyses live in artifacts/runs/<RUN_ID>/reports/ (AGENTS.md).
@@ -37,12 +37,12 @@ def test_config_loading_and_validation(context):
     config = deepcopy(context.config)
     config.pop("_rec_experiments")
     for section in (config["models"], config["extraction"]["graph"], config["extraction"]["description"]):
-        for name in ("qwen3vl_8b", "gemini"):
+        for name in ("qwen3vl_4b", "qwen3vl_8b", "gemini"):
             section.pop(name)
     config["extraction"].pop("gemini")
     _validate_config(config)
     require_generation_config(config, "graph", "qwen3vl_2b")
-    for model in ("qwen3vl_8b", "gemini"):
+    for model in ("qwen3vl_4b", "qwen3vl_8b", "gemini"):
         with pytest.raises(ConfigError, match=f"models.{model}"):
             require_generation_config(config, "graph", model)
     for broken in ({"bge": None}, {"unknown_model": "x"}):
@@ -77,8 +77,8 @@ def test_arm_sources_title_policy_and_cli(context, monkeypatch):
         assert context.run_root / failure_path == context.scene_arm_dir(arms[name].scene_arm) / "failures"
     assert all(not arm.uses_title and arm.name == arm.scene_arm for arm in sources.values())
     assert set(sources) == {
-        "graph_qwen3vl_2b", "desc_qwen3vl_2b", "graph_qwen3vl_8b", "desc_qwen3vl_8b",
-        "graph_gemini", "desc_gemini",
+        "graph_qwen3vl_2b", "desc_qwen3vl_2b", "graph_qwen3vl_4b", "desc_qwen3vl_4b",
+        "graph_qwen3vl_8b", "desc_qwen3vl_8b", "graph_gemini", "desc_gemini",
     }
     assert list(select_arms(context.config, ["graph-activity", "base"])) == ["base", "graph-activity"]
     assert target_set(context.config, ["graph-activity", "base"]) == "base_graph-activity"

@@ -56,7 +56,7 @@ def penalty_schedule(value):
 
 
 # Local Qwen3-VL Instruct checkpoints, one key per parameter size.
-QWEN_MODEL_SIZES = {"qwen3vl_2b": "2B", "qwen3vl_8b": "8B"}
+QWEN_MODEL_SIZES = {"qwen3vl_2b": "2B", "qwen3vl_4b": "4B", "qwen3vl_8b": "8B"}
 QWEN_MODELS = tuple(QWEN_MODEL_SIZES)
 
 
