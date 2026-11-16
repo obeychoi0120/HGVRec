@@ -3,16 +3,39 @@
 from pathlib import Path
 
 from artifact_io import atomic_write_jsonl, read_jsonl
-from extraction.errors import UnsupportedArtifactError
-from extraction.token_usage import validate_tokens
 from extraction.graph_warnings import (
-    DESCRIPTION_WARNING_TAGS, LEGACY_TRUNCATION_ERRORS, PARSE_FAILED, TOKEN_LIMIT,
-    warning_tags,
+    DESCRIPTION_WARNING_TAGS, PARSE_FAILED, warning_tags,
 )
 from extraction.semantic_graph import parse_or_repair_graph, graph_semantic_warnings
 from extraction.structured_output import (
     GRAPH_JSON_SCHEMA, OutputValidationError, normalize_graph_fields, normalize_graph_references,
 )
+
+
+class ExtractionStepError(RuntimeError):
+    pass
+
+
+class UnsupportedArtifactError(ExtractionStepError):
+    """A stored scene row lacks fields the pipeline reads."""
+
+
+def validate_tokens(value):
+    """Output token counts come from the backend, never from text-length estimates."""
+    if value is not None and (type(value) is not int or value < 0):
+        raise ValueError("tokens must be a nonnegative integer or null")
+    return value
+
+
+def qwen_output_tokens(event):
+    value = (event or {}).get("output_tokens")
+    return value if type(value) is int and value >= 0 else None
+
+
+def gemini_output_tokens(diagnostics):
+    usage = (diagnostics or {}).get("usage_metadata") or {}
+    value = usage.get("candidates_token_count", usage.get("candidatesTokenCount"))
+    return value if type(value) is int and value >= 0 else None
 
 GRAPH_FIELDS = ("content_id", "scene_idx", "tokens", "warning", "scene_graph")
 DESCRIPTION_FIELDS = ("content_id", "scene_idx", "tokens", "description")
@@ -22,14 +45,14 @@ FAILURE_FIELDS = ("content_id", "scene_idx", "tokens", "error", "raw_output")
 
 
 def validate_scene_payload(path, row):
-    """Validate current and v8 location payloads without mutating source data."""
+    """Check the fields downstream steps read; extra fields are allowed."""
     path = Path(path)
     fields = FAILURE_FIELDS if "error" in row else (
         GRAPH_FIELDS if "scene_graph" in row
         else TAGGED_DESCRIPTION_FIELDS if "warning" in row else DESCRIPTION_FIELDS
     )
-    if set(row) != set(fields):
-        raise UnsupportedArtifactError(f"unsupported compact scene fields: {path}")
+    if not set(fields) <= set(row):
+        raise UnsupportedArtifactError(f"missing scene fields {sorted(set(fields) - set(row))}: {path}")
     if row["content_id"] != path.stem or type(row["scene_idx"]) is not int or row["scene_idx"] < 0:
         raise ValueError(f"invalid scene identity: {path}")
     validate_tokens(row["tokens"])
@@ -156,20 +179,11 @@ def read_scene_records(path, *, include_failures=False):
 
 
 def reclassify_scene_row(row):
-    """Apply the current outcome rules to one stored row; returns the row unchanged if current.
+    """Apply the current parser to one stored row; returns the row unchanged if current.
 
-    Outputs that older versions stored as truncation errors become TOKEN_LIMIT
-    warnings, and Graph text stored as PARSE_FAILED is parsed again.
+    Graph text stored as PARSE_FAILED is parsed again with the current parser.
     """
-    if "error" in row:
-        text = row["raw_output"].strip()
-        if row["error"] not in LEGACY_TRUNCATION_ERRORS or not text:
-            return row
-        base = {key: row[key] for key in ("content_id", "scene_idx", "tokens")}
-        if row["error"].startswith("graph"):
-            return {**base, "warning": [TOKEN_LIMIT], "scene_graph": row["raw_output"]}
-        return {**base, "description": text, "warning": [TOKEN_LIMIT]}
-    if "scene_graph" not in row:
+    if "error" in row or "scene_graph" not in row:
         return row
     tags, graph = warning_tags(row["warning"]), row["scene_graph"]
     if tags == [PARSE_FAILED] and isinstance(graph, str):
@@ -196,37 +210,6 @@ def reclassify_scene_file(path):
     return True
 
 
-def migrate_scene_failures(directory):
-    """Publish legacy failures inline before removing their old per-content log."""
-    directory = Path(directory)
-    failure_dir = directory / "failures"
-    for source in sorted(failure_dir.glob("*.jsonl")):
-        target = directory / source.name
-        rows = read_jsonl(target) if target.is_file() else []
-        for row in rows:
-            validate_scene_payload(target, row)
-        by_index = {row["scene_idx"]: row for row in rows}
-        if len(by_index) != len(rows):
-            raise ValueError(f"duplicate scene index: {target}")
-        for row in read_jsonl(source):
-            failure = {
-                "content_id": row.get("content_id", source.stem),
-                "scene_idx": row.get("scene_idx"),
-                "tokens": row.get("tokens"),
-                "error": row.get("error") or "generation failed",
-                "raw_output": row.get("raw_output") or "",
-            }
-            validate_scene_payload(target, failure)
-            by_index[failure["scene_idx"]] = failure
-        atomic_write_jsonl(
-            target, sorted(by_index.values(), key=lambda row: row["scene_idx"]),
-            durable=True, sort_keys=False,
-        )
-        source.unlink()
-    if failure_dir.is_dir() and not any(failure_dir.iterdir()):
-        failure_dir.rmdir()
-
-
 def write_scene_records(path, records):
     """Validate all rows before publishing; never migrate existing artifacts."""
     path = Path(path)
@@ -240,13 +223,12 @@ def write_scene_records(path, records):
 
 
 def ensure_generation_identity(directory, provenance, *, force=False):
-    """Record initial settings without blocking resume after policy changes."""
+    """Record the prompt/model settings of the first generation; never blocks resume."""
     from artifact_io import atomic_write_json
-    from model_provenance import canonical
 
     directory = Path(directory)
     identity_path = directory / "generation_identity.json"
-    identity = canonical(provenance)
+    identity = provenance
     directory.mkdir(parents=True, exist_ok=True)
     if force:
         # A new identity must never label old outputs after an interrupted regeneration.

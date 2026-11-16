@@ -20,13 +20,7 @@ def test_config_loading_and_validation(context):
     paths += [context.path("models", key) for key in ("qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "bge")]
     assert all(path.is_relative_to(context.root) for path in paths)
     assert not any(str(path).startswith("/home_nvme") for path in paths)
-    assert Path(settings.dataset.pairs_csv).is_file()
-
-    config = deepcopy(context.config)
-    config.pop("_rec_experiments")
-    config["protocol"]["graph_extractors"] = ["qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "gemini"]
-    config["protocol"]["description_extractors"] = ["qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "gemini"]
-    _validate_config(config)
+    assert Path(settings.dataset["pairs_csv"]).is_file()
 
     # Per-Run analyses live in artifacts/runs/<RUN_ID>/reports/ (AGENTS.md).
     (context.run_root.parent / "reports").mkdir(parents=True)
@@ -45,17 +39,23 @@ def test_config_loading_and_validation(context):
     for model in ("qwen3vl_4b", "qwen3vl_8b", "gemini"):
         with pytest.raises(ConfigError, match=f"models.{model}"):
             require_generation_config(config, "graph", model)
-    for broken in ({"bge": None}, {"unknown_model": "x"}):
-        changed = deepcopy(config)
-        changed["models"] = {k: v for k, v in changed["models"].items() if k not in broken}
-        if "unknown_model" in broken:
-            changed["models"]["unknown_model"] = "x"
-        with pytest.raises(ConfigError):
-            _validate_config(changed)
+    # Unknown keys are allowed so experiments can add settings without editing a validator.
+    config["models"]["unknown_model"] = "x"
+    config["extra_section"] = {"anything": 1}
+    _validate_config(config)
+    # Validation settings fall back to defaults and accept sweep values.
+    config["validation"]["model"] = {"num_blocks": 3, "seeds": [1]}
+    from validation.config import build_validation_config
+
+    swept = build_validation_config(run_id="x", dataset={}, settings=config["validation"],
+                                    model_path=".", output_dir=".")
+    assert (swept.model.num_blocks, swept.model.seeds, swept.model.max_sequence_length) == (3, [1], 10)
+    with pytest.raises(ConfigError):
+        _validate_config({k: v for k, v in config.items() if k != "datasets"})
 
 
 def test_arm_sources_title_policy_and_cli(context, monkeypatch):
-    from arm_registry import RECOMMENDATION_ARM_CONTRACT, feature_source, target_set
+    from arm_registry import feature_source, target_set
 
     arms = registry(context.config)
     assert list(arms) == [
@@ -65,16 +65,11 @@ def test_arm_sources_title_policy_and_cli(context, monkeypatch):
     assert [feature_source(arm) for arm in arms.values()] == [
         "metadata", "desc_qwen3vl_2b", *(["graph_qwen3vl_2b"] * 3),
     ]
-    sources = generation_registry(context.config)
-    from validation.diagnosis_scenes import scene_arms
-
+    sources = generation_registry()
     for name, arm in sources.items():
         expected = context.run_root / "extraction" / name
         assert context.scene_arm_dir(name) == expected
         assert context.extraction_dir(arm.representation, arm.model, "scenes") == expected
-    for name, (scene_path, failure_path) in scene_arms(context.config).items():
-        assert context.run_root / scene_path == context.scene_arm_dir(arms[name].scene_arm)
-        assert context.run_root / failure_path == context.scene_arm_dir(arms[name].scene_arm) / "failures"
     assert all(not arm.uses_title and arm.name == arm.scene_arm for arm in sources.values())
     assert set(sources) == {
         "graph_qwen3vl_2b", "desc_qwen3vl_2b", "graph_qwen3vl_4b", "desc_qwen3vl_4b",
@@ -82,7 +77,6 @@ def test_arm_sources_title_policy_and_cli(context, monkeypatch):
     }
     assert list(select_arms(context.config, ["graph-activity", "base"])) == ["base", "graph-activity"]
     assert target_set(context.config, ["graph-activity", "base"]) == "base_graph-activity"
-    assert RECOMMENDATION_ARM_CONTRACT == "gnn-attn-aggregation/v1"
     assert all(arms[name].aggregation == "mean" for name in ("description", "graph", "graph-activity", "graph-role-activity"))
     assert [arms[name].role_fusion for name in ("graph", "graph-activity", "graph-role-activity")] == [False, False, True]
     assert [arms[name].extensions for name in ("graph", "graph-activity", "graph-role-activity")] == [(), ("segments",), ("segments",)]

@@ -7,7 +7,7 @@ from extraction.scene_executor import graph_scene_result, run_qwen_scenes
 from extraction.scene_storage import read_scene_records, write_scene_records
 from extraction.semantic_graph import parse_or_repair_graph
 from extraction.steps import prepare_scene_batch
-from extraction.step_support import minimal_graph_records, scene_generation_rows
+from extraction.step_support import scene_generation_rows
 from helpers import (
     GRAPH_TEXT,
     NAMED_GRAPH_TEXT,
@@ -264,12 +264,12 @@ def test_scene_storage_resume_and_progress(context, tmp_path):
 
     before = path.read_bytes()
     existing, pending = prepare_scene_batch(
-        [visual], directory, prepare, minimal_graph_records, force=False
+        [visual], directory, prepare, force=False
     )
     assert len(existing[cid]) == 3
     assert [r["scene_idx"] for r in pending[0][1]] == [1, 2, 3]
     assert path.read_bytes() == before
-    _, forced = prepare_scene_batch([visual], directory, prepare, minimal_graph_records, force=True)
+    _, forced = prepare_scene_batch([visual], directory, prepare, force=True)
     assert [r["scene_idx"] for r in forced[0][1]] == [0, 1, 2, 3]
 
     # Progress counts each scene in exactly one outcome.
@@ -445,13 +445,13 @@ def test_truncated_scenes_are_token_limit_warnings_and_regenerate(context, monke
     with pytest.raises(ValueError, match="invalid graph generation arm"):
         extract_graph_scenes(context, model="qwen3vl_2b", arm="desc_qwen3vl_2b", schema=options["schema"])
 
-    # Stored rows follow the current rules first: a legacy truncation error becomes TOKEN_LIMIT
-    # and is generated again; PARSE_FAILED text the current parser reads is kept without generation.
+    # Stored rows follow the current rules first: an error is generated again;
+    # PARSE_FAILED text the current parser reads is kept without generation.
     rows = read_jsonl(path)
     rows[0] = {"content_id": path.stem, "scene_idx": rows[0]["scene_idx"], "tokens": 384,
-               "error": "graph: output truncated at token limit", "raw_output": LOOPED_GRAPH_TEXT}
+               "error": "interrupted generation", "raw_output": LOOPED_GRAPH_TEXT}
     headless = "medium: animation\nformat: narrative\ntopics: duel\nman\nsky\n[Actions]\nman - flying - none; none; sky"
-    rows[-1] = {**rows[-1], "warning": ["MISSING_REQUIRED"], "scene_graph": headless}
+    rows[-1] = {**rows[-1], "warning": ["PARSE_FAILED"], "scene_graph": headless}
     atomic_write_jsonl(path, rows, durable=True, sort_keys=False)
     generator.tasks.clear()
     assert extract_graph_scenes(context, **options)["failure_count"] == 0

@@ -8,13 +8,11 @@ import pytest
 import torch
 
 from arm_registry import registry
-from helpers import PRE_SCENE_ATTENTION_EXPERIMENTS, experiment_identities
 from rec_experiments import CONFIG_KEY, parse_experiments
 from test_scene_extensions import make_model, synthetic_store
 from validation.graph_batching import PackedGraphStore
-from validation.graph_context import EXTENSION_MODELS
 from validation.graph_model import SceneAttentionExchange
-from validation.scene_attention import scene_groups, unit_rms
+from validation.graph_model import scene_groups, unit_rms
 
 pytestmark = pytest.mark.torch
 
@@ -168,27 +166,14 @@ def test_title_changes_values_but_not_attention_weights():
     assert not torch.allclose(before, after)
 
 
-def test_existing_identities_are_unchanged_and_new_ones_record_the_exchange(context, monkeypatch):
-    current = json.loads(json.dumps(experiment_identities(context, monkeypatch), default=str))
-    assert current == SNAPSHOT["identity"]
-    assert len(current["identities"]) == len(PRE_SCENE_ATTENTION_EXPERIMENTS) == 10
-
-    rows = [{"label": "graph+GNN_ATTN", "source": "graph_qwen3vl_2b", "modules": ["GNN_ATTN"]},
-            {"label": "all", "source": "graph_qwen3vl_2b", "modules": ["ASHA", "GNN_ATTN", "REAF"]}]
-    contract = json.dumps(EXTENSION_MODELS, sort_keys=True)
-    new = experiment_identities(context, monkeypatch, rows)["identities"]
-    one, both = new["graph+GNN_ATTN"], new["all"]
-    assert one["experiment_definition"]["modules"] == ["scene_attention"]
-    assert one["experiment_definition"]["module_versions"] == {"scene_attention": "gnn-attn/v1"}
-    assert one["experiment_arm"]["extensions"] == ["scene_attention"]
-    assert one["experiment_arm"]["role_fusion"] is False
-    assert one["item_model"]["extensions"] == {"scene_attention": EXTENSION_MODELS["scene_attention"]}
-    assert both["experiment_definition"]["modules"] == ["role_fusion", "scene_attention", "activity_hypergraph"]
-    assert both["experiment_arm"]["extensions"] == ["scene_attention", "segments"]
-    assert both["item_model"]["extensions"]["segments"]["applied_after"] == "scene_attention_exchange"
-    # Only the identity copy records the new position.
-    assert json.dumps(EXTENSION_MODELS, sort_keys=True) == contract
-    assert EXTENSION_MODELS["segments"]["applied_after"] == "scene_mlp_without_scene_exchange"
+def test_exchange_modules_resolve_to_arm_extensions():
+    resolved = parse_experiments({"experiments": [
+        {"label": "graph+GNN_ATTN", "source": "graph_qwen3vl_2b", "modules": ["GNN_ATTN"]},
+        {"label": "all", "source": "graph_qwen3vl_2b", "modules": ["ASHA", "GNN_ATTN", "REAF"]}]})
+    arms = registry({CONFIG_KEY: resolved})
+    assert arms["graph+GNN_ATTN"].extensions == ("scene_attention",)
+    assert arms["graph+GNN_ATTN"].role_fusion is False
+    assert arms["all"].extensions == ("scene_attention", "segments") and arms["all"].role_fusion
 
 
 def test_config_accepts_exchange_combinations_and_rejects_the_rest():
@@ -212,7 +197,6 @@ def test_config_accepts_exchange_combinations_and_rejects_the_rest():
     for modules, source, extra in (
         (["GNN_ATTN"], "metadata", {}),
         (["GNN_ATTN"], "desc_qwen3vl_2b", {}),
-        (["GNN_ATTN"], "graph_qwen3vl_2b", {"readout": "attn"}),
         (["GNN_ATTN", "scene_attention"], "graph_qwen3vl_2b", {}),
         (["GNN_ATTEN"], "graph_qwen3vl_2b", {}),
         (["GNN_ATTN"], "graph_qwen3vl_2b", {"segments": "random"}),
@@ -291,5 +275,4 @@ def test_logs_show_config_module_names_while_identity_keeps_internal_ones():
     definition = experiment_definition(registry({CONFIG_KEY: resolved})["all"])
     shown = display_definition(definition)
     assert shown["modules"] == ["REAF", "GNN_ATTN", "ASHA"]
-    assert shown["module_versions"] == {"REAF": "role-fusion/v1", "GNN_ATTN": "gnn-attn/v1", "ASHA": "segments-v1"}
     assert definition["modules"] == ["role_fusion", "scene_attention", "activity_hypergraph"]

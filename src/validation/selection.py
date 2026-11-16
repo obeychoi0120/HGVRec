@@ -5,7 +5,7 @@ import hashlib
 import heapq
 import json
 
-from arm_registry import active_arms, select_arms
+from arm_registry import active_arms
 from artifact_io import atomic_write_json, atomic_write_jsonl
 from artifact_io import fingerprint
 from artifact_io import read_json, read_jsonl
@@ -17,10 +17,6 @@ POLICY = "leave-one-out-sequence-catalog/v1"
 
 def cohort_directory(context):
     return context.validation_dir / "cohort"
-
-
-def validation_arms(context, target=None):
-    return select_arms(context.config, target)
 
 
 def data_identity(cohort):
@@ -116,10 +112,7 @@ def build_selection(context):
         "excluded": excluded,
     }
     count = len(source["catalog"])
-    from arm_registry import arm_contract
-
     manifest = {
-        "arm_contract": arm_contract(context.config),
         "arms": list(active_arms(context.config)),
         "policy": POLICY,
         "data_hash": fingerprint(payload),
@@ -141,10 +134,7 @@ def build_selection(context):
 
 def prepare_validation_cohort(context):
     if (cohort_directory(context) / "manifest.json").exists():
-        try:
-            return load_validation_cohort(context)
-        except RuntimeError:
-            pass
+        return load_validation_cohort(context)
     cohort = build_selection(context)
     directory = cohort_directory(context)
     directory.mkdir(parents=True, exist_ok=True)
@@ -190,7 +180,9 @@ def prepare_validation_cohort(context):
     temporary.write_text(
         f"# {context.run_id} / {context.dataset}: leave-one-out cohort\n\n"
         + semantics +
-        "원본 이력 5개 이상 사용자에서 최근 13개를 보존하고, 마지막 1개는 test, 직전 1개는 validation입니다.\n\n"
+        f"원본 이력 {cohort['plan']['preprocessing']['min_user_interactions']}개 이상 사용자에서 "
+        f"최근 {cohort['plan']['preprocessing']['retained_sequence_length']}개를 보존하고, "
+        "마지막 1개는 test, 직전 1개는 validation입니다.\n\n"
         f"| 대상 | 원본 | 선택 | 제외 |\n| --- | ---: | ---: | ---: |\n{rows}\n\n"
         f"짧은 이력 제외 이벤트: {report['short_history_event_count']}; 오래된 이벤트 절단: {cohort['plan']['trimmed_event_count']}.\n\n"
         f"원본 fingerprint: `{report['source_data_hash']}`\n\n분할 fingerprint: `{report['split_hash']}`\n\n"
@@ -206,50 +198,26 @@ def prepare_validation_cohort(context):
     return cohort
 
 
-def load_validation_cohort(context, *, verify_current=True):
+def load_validation_cohort(context):
     directory = cohort_directory(context)
     try:
-        manifest = read_json(directory / "manifest.json")
         cohort = {
             key: read_jsonl(directory / f"{key}.jsonl")
             for key in ("catalog", "metadata_titles", "events", "excluded")
         }
         cohort["plan"] = read_json(directory / "plan.json")
-        if manifest["policy"] != POLICY or fingerprint(cohort) != manifest["data_hash"]:
-            raise ValueError("invalid selection manifest")
-        expected = fingerprint(data_identity(cohort))
-        if expected != manifest["selection_hash"]:
-            raise ValueError("invalid selection manifest")
-        table = EventTable(cohort["events"])
-        if cohort["plan"]["protocol"] != PROTOCOL or table.splits() != cohort["plan"]["splits"]:
-            raise ValueError("invalid leave-one-out split manifest")
-        if [row["item_id"] for row in cohort["catalog"]] != table.items:
-            raise ValueError("invalid leave-one-out catalog")
-        if verify_current:
-            current = build_selection(context)
-            # Registered models do not change catalog, events or the selection policy.
-            if ({k: v for k, v in current["manifest"].items() if k != "arms"}
-                    != {k: v for k, v in manifest.items() if k != "arms"}):
-                raise ValueError("selection inputs changed")
-        return {**cohort, "manifest": manifest}
-    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-        raise RuntimeError(
-            f"missing, invalid, or stale validation cohort; rerun embed-representations: {exc}"
-        ) from exc
+        cohort["manifest"] = read_json(directory / "manifest.json")
+    except OSError as exc:
+        raise RuntimeError(f"missing validation cohort; run embed-representations first: {exc}") from exc
+    return cohort
 
 
 def training_signature(context, cohort, config):
-    from validation.recommendation_contracts import TRAINING_IMPLEMENTATION_VERSION, EVALUATION_CONTRACT
-
+    """Shared-cache key part for training settings; seeds are keyed separately."""
     return fingerprint(
         {
-            "implementation": TRAINING_IMPLEMENTATION_VERSION,
-            "evaluation_contract": EVALUATION_CONTRACT,
-            "events": cohort["events"],
             "selection_hash": cohort["manifest"]["selection_hash"],
-            "model": {
-                k: v for k, v in config.model.model_dump().items() if k != "seeds"
-            },
+            "model": {k: v for k, v in config.model.model_dump().items() if k != "seeds"},
             "cutoffs": config.evaluation.cutoffs,
         }
     )

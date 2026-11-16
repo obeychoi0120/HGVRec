@@ -1,0 +1,5 @@
+# Additional experiments: everything in the main set plus Gemini (Vertex AI) scene extraction.
+# Tested with google-genai 2.23.0. Authenticate with: gcloud auth application-default login
+
+-r requirements-main.txt
+google-genai

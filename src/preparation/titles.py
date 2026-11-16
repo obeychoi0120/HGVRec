@@ -176,20 +176,3 @@ def missing_metadata_report(titles):
         "missing_count": len(missing),
         "items": missing,
     }
-
-
-def metadata_titles_match_catalog(path, catalog, *, allow_blank=False):
-    try:
-        titles = read_jsonl(path)
-        return len(titles) == len(catalog) and all(
-            (
-                set(t) == {"item_id", "content_id", "title"}
-                and str(t["item_id"]) == str(c["item_id"])
-                and (str(t["content_id"]) == str(c["content_id"]))
-                and isinstance(t["title"], str)
-                and (allow_blank or bool(t["title"].strip()))
-                for t, c in zip(titles, catalog, strict=True)
-            )
-        )
-    except (OSError, ValueError):
-        return False

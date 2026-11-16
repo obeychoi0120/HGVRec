@@ -3,23 +3,18 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from artifact_io import read_json, read_jsonl, write_jsonl
+from artifact_io import read_json
 from helpers import (
     TARGETS,
     assert_run_grid,
     prepare_inputs,
-    refresh_checksums,
-    result_identity,
-    selected_table,
     train_inputs,
 )
 from validation.diagnosis_statistics import comparison_contract, comparison_families
-from validation.leave_one_out_diagnosis import cluster_bootstrap, collect_metrics, comparisons
-from validation.leave_one_out_recommendation import combination_complete
+from validation.leave_one_out_diagnosis import cluster_bootstrap, comparisons
 from validation.steps import (
     run_diagnosis,
     run_recommendation,
-    validation_config,
 )
 from helpers import make_context
 
@@ -65,31 +60,19 @@ def test_paired_bootstrap_and_bonferroni_comparisons(context):
         assert item["ci_high"] == pytest.approx(high)
 
 
-def _check_diagnosis_rejects_metric_rank_mismatch(context, monkeypatch, capsys):
+def _check_diagnosis_reports_missing_results(context, monkeypatch, capsys):
     train_inputs(context, monkeypatch)
-    cohort, _, _ = selected_table(context)
-    config = validation_config(context)
-    directory = context.recommendations_dir / "seed_42" / "base"
-    path = directory / "per_event_metrics.jsonl"
-    rows = read_jsonl(path)
-    rows[0]["NDCG@10"] += 0.125
-    write_jsonl(path, rows)
-    refresh_checksums(directory)
-    # Structural completion still passes; the diagnosis must inspect metric semantics.
-    assert combination_complete(directory, result_identity(context, cohort), 3)
-    with pytest.raises(ValueError, match="metric/rank mismatch"):
-        collect_metrics(context, config, cohort, arms={name: name for name in TARGETS})
+    (context.recommendations_dir / "seed_42" / "base" / "complete.json").unlink()
     with pytest.raises(RuntimeError, match="diagnosis failed"):
         run_diagnosis(context, target=TARGETS)
     report = read_json(context.validation_dir / "diagnosis" / "base_graph-activity" / "diagnosis.json")
     assert report["runtime_decision"]["status"] == "fail"
     assert report["statistics"]["status"] == "not_computed"
-    assert "metric/rank mismatch" in report["runtime_decision"]["errors"][0]["message"]
+    assert "missing recommendation result" in report["runtime_decision"]["errors"][0]["message"]
     assert "[Diagnosis] Arm별 최종 test 지표" not in capsys.readouterr().out
 
 
 def _check_five_arm_cpu_roundtrip(context, monkeypatch, capsys):
-    from arm_registry import RECOMMENDATION_ARM_CONTRACT
     from pipeline_runtime import RunContext
     from validation.cli import main
     from validation.graph_inputs import GraphStore
@@ -108,9 +91,6 @@ def _check_five_arm_cpu_roundtrip(context, monkeypatch, capsys):
     graph_arms = ["graph", "graph-activity", "graph-role-activity"]
     assert len({recommendation_identity(context, name)["embedding_hash"] for name in graph_arms}) == 1
     assert len(GraphStore(context.representations_dir / "desc_qwen3vl_2b")["contexts"]) == 48
-    d_identity = recommendation_identity(context, "description")
-    assert d_identity["item_model"]["description_projection_dim"] == 384
-    assert "scene_segments" not in d_identity
     source_bytes = {p: p.read_bytes() for p in context.representations_dir.rglob("*") if p.is_file()}
 
     def forbidden_preparation(*args, **kwargs):
@@ -129,7 +109,6 @@ def _check_five_arm_cpu_roundtrip(context, monkeypatch, capsys):
     assert document["statistics"]["comparison_count"] == len(document["statistics"]["comparisons"]) == 10
     assert all(value["family_size"] == 10 for value in document["statistics"]["comparisons"].values())
     assert document["recommendations"]["actual_event_count"] == 45
-    assert document["arm_contract"] == RECOMMENDATION_ARM_CONTRACT
     assert console[-6].split() == ["Arm", "NDCG@10", "HR@10"]
     for line, arm, label in zip(console[-5:], arms, arms, strict=True):
         means = document["recommendations"]["means"][arm]
@@ -158,7 +137,7 @@ def test_diagnosis_rank_mismatch_and_five_arm_cpu_roundtrip(tmp_path, capsys):
     case = tmp_path / "0"
     capsys.readouterr()
     with pytest.MonkeyPatch.context() as patch:
-        _check_diagnosis_rejects_metric_rank_mismatch(context=make_context(case / "repo"), monkeypatch=patch, capsys=capsys)
+        _check_diagnosis_reports_missing_results(context=make_context(case / "repo"), monkeypatch=patch, capsys=capsys)
     # Five arm cpu roundtrip.
     case = tmp_path / "1"
     capsys.readouterr()

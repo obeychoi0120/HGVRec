@@ -8,9 +8,25 @@
 
 ## scene_graph
 
-대상(최신순): [v10_extended](../prompts/scene_graph_v10_extended.md) · [v10_core](../prompts/scene_graph_v10_core.md) → [v9_extended](../prompts/scene_graph_v9_extended.md) · [v9_core](../prompts/scene_graph_v9_core.md) → [v9(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v9.md) → [v8_2](../prompts/scene_graph_v8_2.md) → [v8](../prompts/scene_graph_v8.md) → [v7](../prompts/scene_graph_v7.md) → [v6](../prompts/scene_graph_v6.md) → [v5](../prompts/scene_graph_v5.md) → [v4](../prompts/scene_graph_v4.md)
+대상(최신순): [v10_extended](../prompts/scene_graph_v10_extended.md) · [v10_core](../prompts/scene_graph_v10_core.md) → [v9_extended](../prompts/scene_graph_v9_extended.md) · [v9_core](../prompts/scene_graph_v9_core.md) → [v9(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v9.md) → [v8_2](../prompts/scene_graph_v8_2.md) → [v8](../prompts/scene_graph_v8.md) → [v7(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v7.md) → [v6(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v6.md) → [v5(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v5.md) → [v4(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_graph_v4.md)
 
 **개선 흐름: 콘텐츠 맥락과 행동을 분리 → 같은 주제 안의 차별점 보존 → 행동별 역할과 불확실성 명확화 → receiver 제거로 역할 구분 부담 축소 → 이름 직접 참조와 모델 크기별 프롬프트 분리 → 규칙 문장 간소화(v10, 효과 미검증) → tool·place 라벨화와 줄 배치 템플릿(v9·v10, 효과 미검증) → 행동 반복 방지 규칙(v9·v10, 효과 미검증) → v10 tool·place 라벨 제거와 고정 두 칸(효과 미검증).**
+
+### 2026-11-16: 사용하지 않는 v2~v7 프롬프트 파일 삭제
+
+저장소 리팩토링에서 `prompts/scene_graph_v2.md`~`scene_graph_v7.md`를 삭제했습니다. 남은 프롬프트(v8·v8_2·v9·v10, scene_description v1~v3)의 내용은 바꾸지 않았습니다.
+
+**삭제 이유.** 테스트, 현재 실행 스크립트와 문서에서 이 파일들을 참조하지 않습니다. 현재 파서(`graph-text/v25`)도 v8 이후 형식만 읽도록 이미 정리되어 있습니다(2026-11-15 항목 참조). 이전 내용은 git 이력과 위 대상 목록의 "삭제됨" 링크에서 볼 수 있습니다. 아래의 v4~v7 변경 이력은 그대로 보존합니다.
+
+**연동 변경(같은 리팩토링).** 프롬프트 파일과 별개로 추출 단계 기록 방식이 바뀌었습니다.
+- `generation_identity.json`의 `model`은 로컬 체크포인트의 파일 서명(크기·mtime·해시) 대신 경로(`{"path": ...}`)만 기록합니다.
+- 이 파일은 기록용이며 임베딩 캐시 키에 들어가지 않습니다. `--schema`는 이제 존재하는 파일이면 확장자와 관계없이 받습니다.
+- Qwen 체크포인트 폴더 이름의 크기 표기(2B/4B/8B) 검사는 삭제했습니다.
+- v8의 `location` 역할을 `place`로 읽는 호환은 유지합니다. 최근 v8 Run(`R13_v8_261115`)에 이 형식으로 저장된 결과가 있기 때문입니다.
+
+**검증한 것.** 삭제 후 전체 테스트(`pytest tests`)가 통과했습니다.
+
+**미검증.** 실제 GPU 추출은 다시 실행하지 않았습니다.
 
 ### 2026-11-15: v10 tool·place 라벨 제거(`; tool; place` 고정 두 칸)
 

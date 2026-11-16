@@ -16,30 +16,12 @@ OUTCOMES = ("success", "repeat_occurred", "parse_failed", "token_limit", "error"
 USABLE_OUTCOMES = ("success", "repeat_occurred")
 DESCRIPTION_OUTCOMES = ("success", "token_limit", "error")
 
-# Tags written by earlier parsers, read as their current equivalent.
-_LEGACY_TAGS = {
-    "PARSE_ERROR": PARSE_FAILED,
-    "MISSING_REQUIRED": PARSE_FAILED,
-    "TRUNCATION_RECOVERED": TOKEN_LIMIT,
-}
-# TRASH_INFO (no usable information) is no longer checked; such scenes are used.
-_REMOVED_TAGS = {"INVALID_ACTION_SYNTAX", "INVALID_REFERENCE", "DUPLICATE_ENTITY_ID", "TRASH_INFO"}
-# Errors that earlier versions stored for outputs cut at the token limit.
-LEGACY_TRUNCATION_ERRORS = {
-    "graph: output truncated at token limit",
-    "description: output truncated at token limit",
-}
-
 
 def warning_tags(values):
-    """Read stored tags as the single current tag; discard retired ones."""
-    if not isinstance(values, list) or any(
-        not isinstance(v, str) or v not in {*WARNING_TAGS, *_LEGACY_TAGS, *_REMOVED_TAGS}
-        for v in values
-    ):
+    """Read stored tags as the single highest-priority tag."""
+    if not isinstance(values, list) or any(not isinstance(v, str) or v not in WARNING_TAGS for v in values):
         raise ValueError("warning must be an array of scene warning tags")
-    tags = {_LEGACY_TAGS.get(value, value) for value in values if value not in _REMOVED_TAGS}
-    return primary_tags(tags)
+    return primary_tags(set(values))
 
 
 def primary_tags(tags):

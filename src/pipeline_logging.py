@@ -18,9 +18,9 @@ def step_settings(context, step, **options):
         kind = "graph" if "graph" in step else "description"
         source = options.get("model")
         arm = (
-            generation_registry(context.config)[options["arm"]]
+            generation_registry()[options["arm"]]
             if options.get("arm")
-            else generated_arm(context.config, kind, source)
+            else generated_arm(kind, source)
         )
         source = arm.model
         values.update(

@@ -2,13 +2,11 @@ from __future__ import annotations
 from functools import partial
 from tqdm import tqdm
 from arm_registry import generated_arm, resolve_generation_arm
-from model_provenance import local_model_identity
 from extraction.backends import GeminiWorkerPool
-from extraction.errors import ExtractionStepError
 from extraction.qwen_runtime import QwenRuntime
 from artifact_io import atomic_write_json, file_fingerprint
 from extraction.qwen_config import (
-    QWEN_MODELS, generation_settings, penalty_schedule, qwen_settings, validate_checkpoint,
+    QWEN_MODELS, generation_settings, penalty_schedule, qwen_settings,
 )
 from extraction.graph_warnings import DESCRIPTION_OUTCOMES, OUTCOMES, needs_generation, outcome
 from extraction.progress import InferenceProgress
@@ -16,15 +14,13 @@ from extraction.semantic_graph.parser import GRAPH_PARSER_VERSION
 from extraction.semantic_graph import GRAPH_SCHEMA_VERSION
 from extraction.scene_executor import run_gemini_scenes, run_qwen_scenes
 from extraction.step_support import (
-    minimal_description_records,
-    minimal_graph_records,
     result,
     scene_generation_rows,
     video_name_map,
     visual_rows,
 )
 from extraction.generation import qwen_generator
-from extraction.scene_storage import read_scene_records, migrate_scene_failures, reclassify_scene_file
+from extraction.scene_storage import ExtractionStepError, read_scene_records, reclassify_scene_file
 from pipeline_logging import log_step_start
 
 LOCAL_MODELS = QWEN_MODELS
@@ -42,12 +38,8 @@ def prompt_provenance(
         raise ValueError("presence penalty is supported only for local vLLM models")
     if stop_repeated_lines and source not in LOCAL_MODELS:
         raise ValueError("stopping before a repeated line is supported only for local vLLM models")
-    if source in LOCAL_MODELS:
-        import json
-        checkpoint = context.path("models", source)
-        validate_checkpoint(source, json.loads((checkpoint / "config.json").read_text()), checkpoint)
     model = (
-        local_model_identity(context.path("models", source))
+        {"path": str(context.path("models", source))}
         if source in LOCAL_MODELS
         else context.config["models"][source]
     )
@@ -88,7 +80,7 @@ def prompt_provenance(
     }
 
 
-def prepare_scene_batch(visuals, scene_dir, prepare_rows, normalize, *, force):
+def prepare_scene_batch(visuals, scene_dir, prepare_rows, *, force):
     existing, planned = {}, []
     for visual in visuals:
         cid = visual["content_id"]
@@ -107,9 +99,6 @@ def prepare_scene_batch(visuals, scene_dir, prepare_rows, normalize, *, force):
             raise ExtractionStepError(
                 f"cannot safely identify existing scenes: {output}: {exc}"
             ) from exc
-        normalize([
-            row for row in cached if not needs_generation(row)
-        ], output)
         by_index = {r["scene_idx"]: r for r in cached}
         if len(by_index) != len(cached):
             raise ExtractionStepError(f"duplicate cached scenes: {output}")
@@ -146,7 +135,7 @@ def _extract(
 
     require_generation_config(context.config, representation, model)
     # --arm is optional: the step and model already determine the source.
-    arm = (generated_arm(context.config, representation, model) if arm is None
+    arm = (generated_arm(representation, model) if arm is None
            else resolve_generation_arm(context.config, arm, representation, model))
     stage = f"extract-{representation}-scenes"
     path = context.prompt_path(schema)
@@ -170,8 +159,6 @@ def _extract(
 
     ensure_generation_identity(scene_dir, provenance, force=force)
     (scene_dir / "generation_stats.json").unlink(missing_ok=True)
-    migrate_scene_failures(scene_dir)
-    normalize = minimal_graph_records if representation == "graph" else minimal_description_records
     visuals = visual_rows(context)
     prepare_rows = partial(
         scene_generation_rows,
@@ -184,7 +171,6 @@ def _extract(
         visuals,
         scene_dir,
         prepare_rows,
-        normalize,
         force=force,
     )
     total = sum((len(scenes) for _, scenes in planned))

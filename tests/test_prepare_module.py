@@ -55,7 +55,6 @@ def _check_prepare_module_cli_builds_segments_without_reencoding(context, monkey
     for arm in ("graph", "graph-activity", "graph-role-activity"):
         identity = recommendation_identity(context, arm)
         assert json.loads(json.dumps(identity)) == identity
-    assert recommendation_identity(context, "graph-activity")["scene_segments"] == recommendation_identity(context, "graph-role-activity")["scene_segments"]
 
     path = directory / "scene_segments.json"
     stale = read_json(path)

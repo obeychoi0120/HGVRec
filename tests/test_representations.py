@@ -1,4 +1,3 @@
-from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -37,7 +36,7 @@ def _check_scene_sources_and_shared_features(context, monkeypatch):
 
 
 def _check_v8_location_reaches_embeddings_and_segments_without_source_rewrite(context, monkeypatch):
-    from artifact_io import read_json, read_jsonl
+    from artifact_io import read_jsonl
     from extraction.scene_storage import read_scene_records
     from validation.selection import load_validation_cohort
     from validation.steps import embed_representations, prepare_module
@@ -61,22 +60,13 @@ def _check_v8_location_reaches_embeddings_and_segments_without_source_rewrite(co
     assert source_identity(context, cohort, arm) != identity_before
     assert all(not row["semantic_warnings"] for row in read_scene_records(path))
 
-    # Reproduce a v1 cache that excluded the same location source before compatibility.
-    with monkeypatch.context() as old_runtime:
-        old_runtime.setattr("validation.graph_inputs.VERSION", "scene-bge-inputs/v1")
-        old_runtime.setattr(
-            "extraction.structured_output.normalize_graph_fields",
-            lambda value: (deepcopy(value), False),
-        )
-        embed_representations(context, target=["graph-activity"])
-    stats_path = context.representations_dir / arm.scene_arm / "statistics.json"
-    assert read_json(stats_path)["counts"]["parse_failed"] == len(rows)
-
     texts, arrays, stats = build_input(context, cohort, arm)
     assert texts == texts_before and stats == stats_before
     for key in arrays:
         np.testing.assert_array_equal(arrays[key], arrays_before[key])
-    result = embed_representations(context, target=["graph-activity"])
+    # Resume keeps the finished bundle; --force rebuilds it from the rewritten source.
+    assert embed_representations(context, target=["graph-activity"])["generated_sources"] == []
+    result = embed_representations(context, target=["graph-activity"], force=True)
     assert result["generated_sources"] == [arm.scene_arm]
     prepare_module(context, target=["graph-activity"])
     store = GraphStore(context.representations_dir / arm.scene_arm)

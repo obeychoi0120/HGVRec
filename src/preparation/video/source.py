@@ -8,7 +8,6 @@ SOURCE_IDENTITY_KEYS = (
     "source_file_size",
     "source_mtime_ns",
 )
-SOURCE_KEYS = (*SOURCE_IDENTITY_KEYS, "duration_seconds")
 
 
 def source_matches_inventory(row: dict[str, Any]) -> bool:

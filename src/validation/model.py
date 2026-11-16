@@ -244,21 +244,6 @@ def seed_everything(seed: int, *, deterministic: bool = True) -> None:
     torch.use_deterministic_algorithms(deterministic)
 
 
-def pad_sequences(
-    sequences: list[list[int]],
-    max_length: int,
-    device: "torch.device",
-) -> "torch.Tensor":
-    result = torch.zeros((len(sequences), max_length), dtype=torch.long, device=device)
-    for index, sequence in enumerate(sequences):
-        values = sequence[-max_length:]
-        if values:
-            # Right padding avoids fully masked queries under a causal attention
-            # mask. Only valid positions are selected for training and scoring.
-            result[index, : len(values)] = torch.tensor(values, dtype=torch.long, device=device)
-    return result
-
-
 def save_checkpoint(path: Path, model: SASRec, metadata: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")

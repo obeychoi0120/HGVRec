@@ -290,7 +290,7 @@ def _visible_gpu_ids():
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("Qwen requires the 'qwen' optional dependencies") from exc
+        raise RuntimeError("Qwen requires torch and vLLM; pip install -r requirements-main.txt") from exc
     available = int(torch.cuda.device_count())
     if available <= 0:
         raise RuntimeError(

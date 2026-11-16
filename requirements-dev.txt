@@ -1,0 +1,4 @@
+# Tests and lint (CPU only; tests need torch from the main set).
+-r requirements-main.txt
+pytest
+ruff

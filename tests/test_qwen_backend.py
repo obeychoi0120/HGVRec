@@ -83,7 +83,7 @@ def test_cli_repetition_penalty_schedule(context, monkeypatch):
     assert [call["repetition_penalty"] for call in calls] == [1.05, [1.05, 1.1, 1.15]]
     assert cli.main([*base, "--repetition-penalty", "1.05", "2.5"]) == 1
 
-    arm = generation_registry(context.config)["graph_qwen3vl_2b"]
+    arm = generation_registry()["graph_qwen3vl_2b"]
     single = prompt_provenance(context, "prompts/scene_graph_v9_core.md", arm, repetition_penalty=1.05)
     schedule = prompt_provenance(context, "prompts/scene_graph_v9_core.md", arm, repetition_penalty=[1.05, 1.1])
     assert single["settings"]["repetition_penalty"] == [1.05]
@@ -93,10 +93,9 @@ def test_cli_repetition_penalty_schedule(context, monkeypatch):
 
 def test_qwen_identity_sizes_and_prompts(context):
     from pathlib import Path
-    from extraction.qwen_config import validate_checkpoint
 
     # The generation identity keeps its initial settings unless forced.
-    arm = generation_registry(context.config)["graph_qwen3vl_2b"]
+    arm = generation_registry()["graph_qwen3vl_2b"]
     initial = prompt_provenance(context, "prompts/scene_graph_v9_core.md", arm)
     directory = context.scene_arm_dir(arm.name)
     ensure_generation_identity(directory, initial)
@@ -119,8 +118,8 @@ def test_qwen_identity_sizes_and_prompts(context):
         assert extended[len(core):].lstrip().startswith("[Additional Instructions]"), version
 
     # Qwen sizes use separate sources and checkpoints.
-    small = generation_registry(context.config)["graph_qwen3vl_2b"]
-    large = generation_registry(context.config)["graph_qwen3vl_8b"]
+    small = generation_registry()["graph_qwen3vl_2b"]
+    large = generation_registry()["graph_qwen3vl_8b"]
     assert context.scene_arm_dir(small.name) != context.scene_arm_dir(large.name)
     assert context.extraction_dir("graph", "qwen3vl_8b", "scenes") == context.scene_arm_dir(large.name)
     identities = [
@@ -130,32 +129,24 @@ def test_qwen_identity_sizes_and_prompts(context):
     assert [item["scene_arm"] for item in identities] == ["graph_qwen3vl_2b", "graph_qwen3vl_8b"]
     assert identities[0]["model"]["path"] != identities[1]["model"]["path"]
     assert identities[1]["settings"]["generation"]["model"] == "qwen3vl_8b"
-    config = read_json(context.path("models", "qwen3vl_2b") / "config.json")
-    with pytest.raises(ValueError, match="expects 8B, but the checkpoint name states 2B"):
-        validate_checkpoint("qwen3vl_8b", config, context.path("models", "qwen3vl_2b"))
-    # A renamed checkpoint without a stated size is accepted.
-    validate_checkpoint("qwen3vl_8b", config, context.path("models", "qwen3vl_2b").parent / "local-vl")
-    with pytest.raises(ValueError, match="expects 8B"):
-        context.config["models"]["qwen3vl_8b"] = context.config["models"]["qwen3vl_2b"]
-        prompt_provenance(context, "prompts/scene_graph_v9_extended.md", large)
 
 
 def test_qwen3vl_4b_source_and_checkpoint(context, monkeypatch):
     from arm_registry import generated_arm, resolve_generation_arm
     from extraction import cli
-    from extraction.qwen_config import QWEN_MODELS, generation_settings, validate_checkpoint
+    from extraction.qwen_config import QWEN_MODELS, generation_settings
     from extraction.steps import GRAPH_SOURCES, LOCAL_MODELS
     from pipeline_runtime import require_generation_config
 
     # 4B is a third local size beside 2B and 8B with its own sources and directories.
     assert QWEN_MODELS == ("qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b")
     assert "qwen3vl_4b" in LOCAL_MODELS and "qwen3vl_4b" in GRAPH_SOURCES
-    sources = generation_registry(context.config)
+    sources = generation_registry()
     for prefix, kind in (("graph", "graph"), ("desc", "description")):
         arm = sources[f"{prefix}_qwen3vl_4b"]
         assert (arm.representation, arm.model, arm.scene_arm, arm.uses_title) == (
             kind, "qwen3vl_4b", f"{prefix}_qwen3vl_4b", False)
-        assert generated_arm(context.config, kind, "qwen3vl_4b") == arm
+        assert generated_arm(kind, "qwen3vl_4b") == arm
         assert resolve_generation_arm(context.config, arm.name, kind, "qwen3vl_4b") == arm
         with pytest.raises(ValueError, match="requested extraction model"):
             resolve_generation_arm(context.config, arm.name, kind, "qwen3vl_8b")
@@ -186,16 +177,6 @@ def test_qwen3vl_4b_source_and_checkpoint(context, monkeypatch):
     assert identity["model"]["path"] != prompt_provenance(
         context, "prompts/scene_graph_v9_core.md", sources["graph_qwen3vl_2b"])["model"]["path"]
 
-    # A checkpoint whose name states another size is rejected in both directions.
-    config = read_json(context.path("models", "qwen3vl_4b") / "config.json")
-    validate_checkpoint("qwen3vl_4b", config, context.path("models", "qwen3vl_4b"))
-    with pytest.raises(ValueError, match="expects 4B, but the checkpoint name states 2B"):
-        validate_checkpoint("qwen3vl_4b", config, context.path("models", "qwen3vl_2b"))
-    with pytest.raises(ValueError, match="expects 8B, but the checkpoint name states 4B"):
-        validate_checkpoint("qwen3vl_8b", config, context.path("models", "qwen3vl_4b"))
-    with pytest.raises(ValueError, match="expects 4B"):
-        context.config["models"]["qwen3vl_4b"] = context.config["models"]["qwen3vl_8b"]
-        prompt_provenance(context, "prompts/scene_graph_v9_core.md", sources["graph_qwen3vl_4b"])
 
 
 @pytest.mark.torch

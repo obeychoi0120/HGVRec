@@ -1,0 +1,19 @@
+# Main experiments: fully on-device pipeline
+# (preparation -> Qwen3-VL scene extraction with vLLM -> BGE embedding -> SASRec training -> diagnosis).
+#
+# Tested with Python 3.12, CUDA 13.0 and:
+#   torch 2.13.0+cu130, transformers 5.19.0, vllm 0.32.0, numpy 2.3.5,
+#   Pillow 12.3.0, pydantic 2.13.5, PyYAML 6.0.3, tqdm 4.70.0
+# Install the torch build that matches your CUDA driver first if pip picks the wrong one
+# (see https://pytorch.org/get-started/locally/).
+#
+# System tools (not pip): ffmpeg and ffprobe must be on PATH.
+
+numpy
+Pillow
+pydantic>=2
+PyYAML
+tqdm
+torch
+transformers>=5.2.0
+vllm>=0.28.0; sys_platform == "linux"

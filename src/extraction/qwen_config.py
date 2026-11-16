@@ -19,31 +19,8 @@ QWEN_DEFAULTS = {
 
 
 def qwen_settings(value: dict[str, Any] | None = None) -> dict[str, Any]:
-    if value is None:
-        value = {}
-    if not isinstance(value, dict) or set(value) - QWEN_DEFAULTS.keys():
-        raise ValueError("extraction.qwen contains unknown settings or is not a mapping")
-    result = {**QWEN_DEFAULTS, **value}
-    memory = result["gpu_memory_utilization"]
-    if type(memory) not in (int, float) or not math.isfinite(memory) or not 0 < memory <= 1:
-        raise ValueError("extraction.qwen.gpu_memory_utilization must be in (0, 1]")
-    for key in ("max_num_seqs", "max_num_batched_tokens", "renderer_num_workers"):
-        if type(result[key]) is not int or result[key] <= 0:
-            raise ValueError(f"extraction.qwen.{key} must be a positive integer")
-    length = result["max_model_len"]
-    if length != "auto" and (type(length) is not int or length <= 0):
-        raise ValueError("extraction.qwen.max_model_len must be auto or a positive integer")
-    for key in ("enable_chunked_prefill", "enable_prefix_caching", "enforce_eager"):
-        if type(result[key]) is not bool:
-            raise ValueError(f"extraction.qwen.{key} must be true or false")
-    if result["async_scheduling"] is not None and type(result["async_scheduling"]) is not bool:
-        raise ValueError("extraction.qwen.async_scheduling must be null, true or false")
-    if not result["enable_chunked_prefill"] and length != "auto":
-        if result["max_num_batched_tokens"] < length:
-            raise ValueError(
-                "without chunked prefill max_num_batched_tokens must cover max_model_len"
-            )
-    return result
+    """vLLM engine settings: config values over defaults; vLLM validates them."""
+    return {**QWEN_DEFAULTS, **(value or {})}
 
 
 def penalty_schedule(value):
@@ -103,35 +80,3 @@ def generation_settings(
         "model": model,
         **({"stop_repeated_lines": True} if stop_repeated_lines else {}),
     }
-
-
-def validate_checkpoint_family(config: dict) -> None:
-    """Reject checkpoints that are not Qwen3-VL Instruct models."""
-    if config.get("model_type") != "qwen3_vl" or "Qwen3VLForConditionalGeneration" not in config.get("architectures", []):
-        raise ValueError("checkpoint is not Qwen3-VL: expected qwen3_vl/Qwen3VLForConditionalGeneration")
-    if config.get("_name_or_path") and "Thinking" in config["_name_or_path"]:
-        raise ValueError("Qwen3-VL requires the Instruct checkpoint")
-
-
-def validate_checkpoint(model: str, config: dict, path=None) -> None:
-    """Check the family and, when a path is known, that its name states no other size."""
-    if model not in QWEN_MODEL_SIZES:
-        raise ValueError(f"unsupported Qwen model: {model}")
-    validate_checkpoint_family(config)
-    if path is None:
-        return
-    from pathlib import Path
-
-    def sizes(name):
-        token = f"-{name.upper().replace('/', '-')}-"
-        return {size for size in QWEN_MODEL_SIZES.values() if f"-{size}-" in token}
-
-    size = QWEN_MODEL_SIZES[model]
-    stated = sizes(Path(path).name) | sizes(Path(path).resolve().name)
-    stated |= sizes(str(config.get("_name_or_path") or ""))
-    # A renamed checkpoint without a size is accepted; only a conflicting size is rejected.
-    if stated - {size}:
-        raise ValueError(
-            f"{model} expects {size}, but the checkpoint name states "
-            f"{', '.join(sorted(stated))}: {path}"
-        )

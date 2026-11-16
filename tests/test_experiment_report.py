@@ -1,7 +1,6 @@
-from arm_registry import RECOMMENDATION_ARM_CONTRACT, registry
+from arm_registry import registry
 from rec_experiments import experiment_definition
 from validation.experiment_report import write_report
-from validation.recommendation_contracts import ARCHITECTURE_VERSION
 
 
 def test_report_uses_recorded_definitions_and_all_contrasts(context):
@@ -12,11 +11,10 @@ def test_report_uses_recorded_definitions_and_all_contrasts(context):
     from itertools import combinations
 
     document = {
-        "run_id": context.run_id, "arm_contract": RECOMMENDATION_ARM_CONTRACT,
+        "run_id": context.run_id,
         "targets": arms,
         "experiments": [experiment_definition(arm) for arm in registry(context.config).values()],
         "recommendations": {
-            "architecture_version": ARCHITECTURE_VERSION,
             "means": means, "standard_deviations": deviations,
             "baseline": None, "base_relative_changes": None, "model_reports": models,
             "per_seed": [{"arm": arm, "seed": 42, **means[arm]} for arm in arms],
@@ -45,8 +43,7 @@ def test_report_uses_recorded_definitions_and_all_contrasts(context):
     assert "| base |" in text
     assert "| description | desc_qwen3vl_2b | 5 | 50.00% | 2 | 1 | 100 | 100 |" in text
     # Reports show config module names; the recorded definitions keep the internal ones.
-    assert "ASHA=segments-v1" in text and "REAF=role-fusion/v1" in text
+    assert "ASHA" in text and "REAF" in text
     assert "activity_hypergraph" not in text and "role_fusion" not in text
     assert any("activity_hypergraph" in row["modules"] for row in document["experiments"])
-    assert ARCHITECTURE_VERSION in text
     assert text.count("| -0.100000 |") == 10

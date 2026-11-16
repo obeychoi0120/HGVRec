@@ -99,7 +99,7 @@ class PackedGraphStore:
             arrays["segment_scenes"] = owners
             arrays["segment_ids"] = np.unique(np.asarray(pairs[indices, 1]), return_inverse=True)[1].reshape(-1)
         if scene_groups:
-            from validation.scene_attention import scene_groups as groups
+            from validation.graph_model import scene_groups as groups
 
             # Only the scene_attention extension asks for groups, so other batches stay byte-identical.
             arrays.update(groups(offsets))

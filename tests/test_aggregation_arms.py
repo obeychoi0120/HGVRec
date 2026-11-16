@@ -64,7 +64,7 @@ def test_worker_consumes_mixed_arm_jobs(context, monkeypatch):
     assert [status for status, _ in responses] == ["complete", "complete"]
     for _, identity in responses:
         directory = context.recommendations_dir / f"seed_{identity['seed']}" / identity["arm"]
-        assert combination_complete(directory, identity, 3)
+        assert combination_complete(directory)
         assert np.isfinite(np.load(directory / "catalog_vectors.npy")).all()
 
 

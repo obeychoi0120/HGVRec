@@ -1,243 +1,315 @@
 # ViewingContextPipeline
 
-MicroLens-100K 영상 또는 M³L-10M 영화 예고편에서 관측 정보를 추출하고, **영문 제목에 영상 관측 정보와 표현 모듈을 더했을 때 추천 성능이 어떻게 달라지는지** 비교하는 실험 파이프라인입니다. 동일한 사용자·후보 아이템 목록(catalog)·분할에서 설정한 실험들을 독립적으로 학습하고 평가합니다.
+짧은 영상의 키프레임에서 **온디바이스 멀티모달 LLM으로 장면 그래프를 추출**하고, 이를 시퀀셜 추천(SASRec)의 영상 표현으로 쓰는 연구용 파이프라인입니다. MicroLens-100K와 M³L-10M 데이터셋을 지원합니다.
 
-## 프로젝트 소개와 전체 흐름
+![파이프라인: 키프레임 → 장면 그래프 생성 → REAF → ASHA → 추천](docs/design/hgvrec_pipeline_1row.png)
 
-![HGVRec: REAF의 장면 내부 역할 결합과 ASHA의 Action 구간 집계를 통한 비디오 표현 학습](WWW2027/figures/hgvrec_framework.png)
+그림의 각 단계와 실행 명령은 다음과 같이 대응합니다.
 
-그림은 HGVRec의 전체 구조입니다. 논문의 Motivation·Framework 그림은 `python docs/design/generate_hgvrec_figures.py`로 재생성하며, 편집용 PPTX·벡터 PDF·600dpi PNG는 `WWW2027/figures/`에 저장합니다. 생성에는 `python-pptx`, `PyMuPDF`, LibreOffice가 필요합니다.
+| 그림 | 하는 일 | 명령 |
+| --- | --- | --- |
+| Input | 영상을 30초 창으로 나누고 창마다 키프레임 추출 | `python -m preparation …` |
+| Step 1 | 온디바이스 VLM(Qwen3-VL 2B/4B/8B)으로 장면별 Context·Entities·Actions 그래프 생성 | `python -m extraction …` |
+| Step 2–3 | BGE로 텍스트 특징을 고정하고, REAF(역할 결합)·ASHA(행동 구간 Hypergraph) 모듈로 영상 벡터 구성 | `python -m validation embed-representations`, `prepare-module` |
+| Step 4 | 영상 벡터를 SASRec으로 학습·평가하고 실험 간 통계 비교 | `python -m validation run-recommendation`, `run-diagnosis` |
 
-`preparation → extraction → validation` 순서로 처리합니다. 제목은 장면 추출에 넣지 않고 추천 인코더에서 결합합니다. **BGE 특징은 동결하고, 투영층·장면 인코더·선택 모듈·SASRec은 추천 loss로 함께 학습합니다.** 학습된 장면·영상 벡터는 추천 모델의 forward에서 계산합니다.
+## 목차
 
-추천 실험은 `source + modules + readout`으로 정의합니다. metadata는 제목만, Description은 장면별 문단, Graph는 장면 내부의 Entity·Action·Context와 역할 연결을 사용합니다. 각 실험의 최종 영상·사용자 벡터는 512차원입니다.
+- [요구 사항](#요구-사항)
+- [설치](#설치)
+- [환경 설정](#환경-설정)
+- [실행](#실행)
+- [결과 확인과 재실행](#결과-확인과-재실행)
+- [실험 구성](#실험-구성)
+- [테스트와 상세 문서](#테스트와-상세-문서)
 
-## 추천 실험 구성
+## 요구 사항
 
-저장소 루트의 [rec_experiments_config.yaml](rec_experiments_config.yaml)을 편집합니다. 다음은 초기 구성의 예시이며, 실험 수와 이름은 이 목록으로 고정되지 않습니다.
+| 항목 | Main 실험 (온디바이스) | 추가 실험 (Gemini 포함) |
+| --- | --- | --- |
+| OS | Linux | Linux |
+| Python | 3.11 이상 (3.12에서 확인) | 같음 |
+| GPU | 장면 추출에 CUDA GPU 필수. 추천 학습은 CPU에서도 실행 가능 | 같음. Gemini 추출만 할 때는 GPU 불필요 |
+| 시스템 도구 | `ffmpeg`, `ffprobe` | 같음 |
+| 모델 가중치 | Qwen3-VL Instruct(2B/4B/8B 중 사용할 것), `bge-large-en-v1.5` | Main + Vertex AI의 Gemini 접근 권한 |
 
-```yaml
-version: 1
+## 설치
 
-defaults:
-  readout: mean
-
-experiments:
-  - label: base
-    source: metadata
-    modules: []
-
-  - label: description
-    source: desc_qwen3vl_2b
-    modules: []
-
-  - label: graph
-    source: graph_qwen3vl_2b
-    modules: []
-
-  - label: graph-activity
-    source: graph_qwen3vl_2b
-    modules: [ASHA]
-
-  - label: graph-role-activity
-    source: graph_qwen3vl_2b
-    modules: [REAF, ASHA]
-```
-
-| 항목 | 설정 방법 |
-| --- | --- |
-| `version` | `1` |
-| `defaults.readout` | 선택 항목. 생략하면 `mean`. 공통 `source`는 허용하지 않습니다. |
-| `experiments[].label` | 필수 사용자 지정 이름. 소문자 영문으로 시작하고 영문 소문자·숫자·하이픈만 사용하며 중복은 허용하지 않습니다. 모델 구조를 결정하지 않습니다. |
-| `experiments[].source` | 각 실험에 필수. `metadata`, `graph_qwen3vl_2b`, `desc_qwen3vl_2b`, `graph_qwen3vl_4b`, `desc_qwen3vl_4b`, `graph_qwen3vl_8b`, `desc_qwen3vl_8b`, `graph_gemini`, `desc_gemini` 중 선택합니다. |
-| `experiments[].modules` | 생략하면 `[]`. Graph source에서 `REAF`(role_fusion), `GNN_ATTN`(scene_attention), `ASHA`(activity_hypergraph)를 단독 또는 함께 사용할 수 있습니다. 결과 identity에는 괄호 안의 내부 이름이 기록되며, 내부 이름도 설정에서 계속 읽습니다. 단계 로그와 보고서에는 설정 이름(`REAF`, `GNN_ATTN`, `ASHA`)으로 표시합니다. |
-| `experiments[].readout` | 개별 값 → 공통값 → `mean` 순서로 적용합니다. 현재 `mean`만 지원합니다. |
-| `experiments[].segments` | 선택 항목. `ASHA`가 있는 실험에서만 허용합니다. 생략하면 기본 활동 구간을 사용하고 기존 결과 identity가 바뀌지 않습니다. `action_bag`, `time_window`, `random` 중 하나를 지정하면 모델 구조는 같고 장면–구간 소속만 바꾼 ablation이 됩니다. 아래 표를 참고하세요. |
-| `experiments[].segments_seed` | 선택 항목. 생략하면 `0`. `segments` 변형을 만드는 난수 seed이며 0 이상의 정수입니다. 모델 학습 seed와는 별개입니다. |
-
-`segments` 변형은 기본 활동 구간이 묶는 두 조건, 즉 같은 Action key와 연속된 장면을 분리합니다.
-
-| 값 | 같은 Action | 연속성 | 구성 |
-| --- | --- | --- | --- |
-| (생략) | O | O | 같은 key를 가진 연속 장면 구간 |
-| `action_bag` | O | X | 같은 key를 가진 영상 내 모든 장면을 하나의 구간으로 묶음 |
-| `time_window` | X | O | 기본 구간의 길이를 유지하고, 같은 영상의 연속 장면 구간 중 하나로 위치만 무작위 이동 |
-| `random` | X | X | 영상별 장면 순열을 기본 구간에 적용. 구간 수·크기·장면별 소속 수가 유지됨 |
-
-```yaml
-  - label: HGVRec-bag
-    source: graph_qwen3vl_2b
-    modules: [REAF, ASHA]
-    segments: action_bag
-
-  - label: HGVRec-random-s1
-    source: graph_qwen3vl_2b
-    modules: [REAF, ASHA]
-    segments: random
-    segments_seed: 1
-```
-
-제목은 모든 추천 실험에 포함하며 `use_title` 설정은 제공하지 않습니다. `metadata` 실험은 최대 하나이고, label에 관계없이 상대 성능 변화율의 기준이 됩니다. 없으면 상대 변화율을 생략합니다.
-
-실험을 추가하려면 항목을 복사해 새 label과 source·modules를 적고, 삭제하려면 해당 항목을 제거합니다. Role Fusion만 비교하려면 Graph source에 `modules: [REAF]`를 지정합니다. 새로운 알고리즘은 코드 구현과 등록이 필요하며, 등록된 모듈의 조합은 YAML에서 변경합니다. 알 수 없는 설정·모듈, 중복 이름·모듈, 잘못된 조합과 빈 실험 목록은 실행 전에 거부합니다.
-
-**모든 validation 명령은 이 파일의 전체 실험을 목록 순서로 처리합니다.** 일부만 실행하려면 파일의 목록을 해당 실험들로 구성합니다. `--target`, `--experiments`는 지원하지 않습니다. 설정은 명령 시작에 한 번 읽고 worker에도 같은 내용을 전달합니다. 실행 중 파일을 바꾸면 다음 명령부터 적용되므로 단계 사이에도 의도한 구성을 유지하세요.
-
-## 실행 환경과 데이터 설정
-
-저장소 루트에서 실행합니다. Ubuntu/Bash·Python 3.11 이상, 영상 준비를 위한 `ffmpeg`·`ffprobe`, 데이터와 로컬 모델 가중치가 필요합니다.
+conda 환경을 만들고 `ffmpeg`를 설치합니다.
 
 ```bash
-python -m pip install -e ".[train,embedding,dev]"
-python -m pip check
+conda create -n vc python=3.12 -y
+conda activate vc
+conda install -c conda-forge ffmpeg -y
 ```
 
-Qwen 장면 추출 환경에는 `python -m pip install -e ".[qwen,dev]"`를 추가로 실행합니다. Linux/CUDA와 Qwen3-VL-2B·4B·8B-Instruct의 비양자화 BF16 checkpoint를 사용합니다. Gemini는 `python -m pip install -e ".[gemini,dev]"`로 설치하고 Vertex 프로젝트·위치·모델, ADC 인증·호출 권한을 설정합니다. 추출 환경과 임베딩·추천 환경은 분리할 수 있습니다.
+저장소를 받고 의존성과 패키지를 설치합니다. 의존성은 실험 범위에 따라 나뉩니다.
 
-| 설정 파일 | 역할 |
+| 파일 | 범위 |
 | --- | --- |
-| [config.yaml](config.yaml) | 데이터·모델 경로, 추출·학습·평가·실행 자원 설정 |
-| [rec_experiments_config.yaml](rec_experiments_config.yaml) | 비교할 추천 실험의 이름·입력 소스·모듈·집계 방식 |
-
-`config.yaml`에서는 다음 항목을 확인합니다. 상대 경로는 저장소 루트 기준입니다.
-
-| 설정 키 | 확인할 내용 |
-| --- | --- |
-| `datasets.<dataset>.data`, `datasets.<dataset>.source_counts` | 원본 데이터 경로와 검증할 개수 |
-| `models.qwen3vl_2b`, `models.qwen3vl_4b`, `models.qwen3vl_8b`, `models.bge`, `models.gemini` | 필요한 로컬 가중치 또는 Gemini 호출 설정. Qwen 경로의 폴더 이름에는 해당 크기(`2B`·`4B`·`8B`)가 들어 있어야 합니다. |
-| `extraction.visual_evidence` | 시간 창·키프레임 수·해상도 |
-| `extraction.qwen`, `extraction.gemini` | 추론 엔진·동시 실행 설정 |
-| `extraction.{graph,description}.{qwen3vl_2b,qwen3vl_4b,qwen3vl_8b,gemini}` | 장면 출력 토큰 한도 |
-| `validation.cohort`, `validation.encoder` | 사용자 이력 처리와 BGE 인코딩 |
-| `validation.model`, `validation.evaluation` | seed·학습·결정적 연산·평가·통계 설정 |
-| `validation.graph_execution` | 특징 캐시·chunk·checkpoint 실행 설정 |
-| `artifacts_root` | 산출물 상위 디렉터리 |
-
-모든 명령에 `--dataset microlens_100k` 또는 `--dataset m3l_10m`을 지정합니다. 한 명령은 한 데이터셋만 처리하며, 같은 Run ID라도 데이터셋별 산출물과 캐시는 분리됩니다. 선택하지 않은 데이터셋의 원본 파일은 없어도 됩니다.
-
-MicroLens는 interaction CSV·영상·제목을, M³L은 `data.root` 아래 MovieLens 평점·제목·ID 매핑과 원본 movie ID의 예고편을 사용합니다. M³L은 모든 평점을 상호작용으로 사용하고 미확보·손상 영상의 영화와 상호작용을 제외하므로 **평가한 영화 이력의 다음 영화 예측**으로 해석합니다. 입력 파일과 제외 정책은 [데이터 입력 규칙](docs/runtime.md#데이터-입력과-cohort)에 설명합니다.
-
-## 단계별 실행
-
-다음은 초기 Qwen source 구성을 처음 실행하는 예시입니다. 실행할 환경에서 설정과 필요한 원본·모델 경로를 먼저 확인합니다.
+| [requirements-main.txt](requirements-main.txt) | Main 실험. 전처리, Qwen3-VL 추출(vLLM), BGE 임베딩, 추천 학습·진단 |
+| [requirements-extra.txt](requirements-extra.txt) | 추가 실험. Main + Gemini(`google-genai`) |
+| [requirements-dev.txt](requirements-dev.txt) | Main + 테스트·lint(`pytest`, `ruff`) |
 
 ```bash
-RUN_ID="experiment_001"
-DATASET="microlens_100k"
+git clone <repo-url> ViewingContextPipeline
+cd ViewingContextPipeline
+pip install -r requirements-main.txt
+pip install -e .
 ```
 
-### 1. 데이터와 키프레임 준비
+Gemini 추출까지 쓰려면 Main 대신 추가 실험 의존성을 설치합니다.
+
+```bash
+pip install -r requirements-extra.txt
+```
+
+- pip가 드라이버와 맞지 않는 CUDA 빌드의 `torch`를 고르면, [PyTorch 설치 안내](https://pytorch.org/get-started/locally/)에 따라 `torch`를 먼저 설치한 뒤 위 명령을 실행합니다.
+- 확인한 조합은 torch 2.13.0+cu130, transformers 5.19.0, vllm 0.32.0입니다.
+
+## 환경 설정
+
+모든 명령은 저장소 루트에서 실행합니다. `config.yaml`의 상대 경로도 저장소 루트를 기준으로 합니다.
+
+### 1. 모델 가중치 받기
+
+코드는 로컬 경로에서만 가중치를 읽고 자동으로 내려받지 않습니다. 필요한 모델을 먼저 받아 둡니다.
+
+```bash
+hf download Qwen/Qwen3-VL-2B-Instruct --local-dir /path/to/models/Qwen3-VL-2B-Instruct
+hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /path/to/models/Qwen3-VL-4B-Instruct
+hf download Qwen/Qwen3-VL-8B-Instruct --local-dir /path/to/models/Qwen3-VL-8B-Instruct
+hf download BAAI/bge-large-en-v1.5 --local-dir /path/to/models/bge-large-en-v1.5
+```
+
+Qwen은 실제로 쓰는 크기만 받으면 됩니다. BGE는 임베딩 단계에서 항상 필요합니다.
+
+### 2. 데이터 배치
+
+**MicroLens-100K**는 다음 파일이 필요합니다.
+
+```text
+MicroLens-100k_pairs.csv        # user,item,timestamp(ms)
+MicroLens-100k_title_en.csv     # item,title
+MicroLens-50k_titles.csv        # (선택) 빈 제목 보완
+MicroLens-100k_videos/{item_id}.mp4
+```
+
+**M³L-10M**은 `root` 아래 다음 구조를 둡니다.
+
+```text
+<root>/metadata/ratings.dat
+<root>/metadata/movies.dat
+<root>/metadata/id_mmrec_to_grouplens.tsv
+<root>/videos/{original_GroupLens_movieId}.mp4
+```
+
+쓰지 않는 데이터셋의 파일은 없어도 됩니다. 입력 형식과 제외 규칙은 [데이터 입력](docs/runtime.md#데이터-입력과-cohort)에 정리되어 있습니다.
+
+### 3. `config.yaml` 수정
+
+[config.yaml](config.yaml)에서 경로를 내 환경에 맞게 바꿉니다. 경로가 placeholder로 비워져 있고 항목마다 설명 주석이 달린 [config.example.yaml](config.example.yaml)을 복사해 시작해도 됩니다.
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+주로 바꿀 항목은 다음과 같습니다.
+
+```yaml
+artifacts_root: artifacts            # 모든 산출물이 저장되는 위치
+datasets:
+  microlens_100k:
+    data:
+      pairs_csv: /path/to/MicroLens-100k_pairs.csv
+      videos_dir: /path/to/MicroLens-100k_videos
+      titles_csv: /path/to/MicroLens-100k_title_en.csv
+      titles_supplement_csv: /path/to/MicroLens-50k_titles.csv
+  m3l_10m:
+    data:
+      root: /path/to/m3l-10m
+models:
+  qwen3vl_2b: /path/to/models/Qwen3-VL-2B-Instruct
+  bge: /path/to/models/bge-large-en-v1.5
+```
+
+- `models`, `extraction.graph`, `extraction.description`에는 실제로 쓰는 모델만 남겨도 됩니다. 빠진 모델로 추출하면 그 단계에서 바로 오류가 납니다.
+- 그 밖의 값은 기본값으로 실행할 수 있습니다.
+  - `extraction.visual_evidence`: 시간 창 길이, 키프레임 수, 해상도
+  - `extraction.qwen`: vLLM 엔진 설정
+  - `validation.model`, `validation.evaluation`: 학습 크기, seed, cutoff, bootstrap 수
+- 모르는 키를 추가해도 거부하지 않습니다. `validation` 아래 값은 [기본값](src/validation/config.py)이 있어 생략할 수 있습니다.
+
+### 4. 추천 실험 목록 만들기
+
+`rec_experiments_config.yaml`은 Run마다 바꿔 쓰는 파일이라 git에서 제외되어 있습니다. 예시를 복사해서 씁니다.
+
+```bash
+cp rec_experiments_config.example.yaml rec_experiments_config.yaml
+```
+
+### 5. (추가 실험) Gemini 설정
+
+Gemini는 Vertex AI를 ADC(Application Default Credentials)로 호출합니다. API 키는 쓰지 않습니다.
+
+```bash
+gcloud auth application-default login
+```
+
+`config.yaml`의 `models.gemini`에 본인 프로젝트를 지정합니다.
+
+```yaml
+models:
+  gemini:
+    project_id: <your-gcp-project>
+    location: global
+    model_id: gemini-3.8-flash
+    temperature: 0.0
+    thinking_level: low
+    media_resolution: MEDIA_RESOLUTION_LOW
+extraction:
+  gemini:
+    threads: 128                     # 동시 요청 수
+```
+
+## 실행
+
+```bash
+RUN_ID=exp001
+DATASET=microlens_100k   # 또는 m3l_10m
+```
+
+각 명령은 독립 단계이며, 앞 단계가 끝난 뒤 다음 단계를 실행합니다. 사용할 GPU는 `CUDA_VISIBLE_DEVICES`로 고릅니다.
+
+아래 단계를 한 번에 실행하는 스크립트 예시도 있습니다. 복사본 `run_script.sh`는 git에서 제외됩니다.
+
+```bash
+cp run_script.example.sh run_script.sh   # RUN_ID, DATASET, MODEL 등을 수정
+bash run_script.sh
+```
+
+### 1. 전처리 (Input)
 
 ```bash
 python -m preparation prepare-cohort --run-id "$RUN_ID" --dataset "$DATASET"
 python -m preparation prepare-input-data --run-id "$RUN_ID" --dataset "$DATASET"
 ```
 
-`prepare-cohort`는 데이터·영상·제목을 점검하고 공유 cohort를 준비합니다. 영상 관측 source를 사용할 때 `prepare-input-data`로 키프레임을 준비합니다. metadata만 사용하는 실험에는 키프레임 준비와 장면 추출이 필요 없습니다.
+- `prepare-cohort`는 상호작용·제목·영상 목록을 읽어 데이터셋별 공유 cohort를 만듭니다.
+- `prepare-input-data`는 키프레임을 추출합니다. 제목만 쓰는 `metadata` 실험만 돌린다면 이 단계와 장면 추출은 필요 없습니다.
 
-### 2. 필요한 source 추출
+### 2. 장면 추출 (Step 1)
 
-YAML에서 사용하는 서로 다른 시각 source만 준비합니다. 추출 명령의 `--arm`은 source 식별자이며 추천 실험의 label과 구분합니다. source는 추출 명령과 `--model`로 정해지므로 `--arm`은 생략할 수 있고, 넣으면 일치하는지만 확인합니다. `config.yaml`의 `models`·`extraction.graph`·`extraction.description`에는 실제로 쓰는 모델만 두면 되며(`bge`는 필수), Gemini를 쓰지 않으면 `models.gemini`·`extraction.gemini`도 생략할 수 있습니다. 빠진 모델로 추출을 시작하면 그 단계에서 바로 오류를 냅니다.
+실험 목록에서 쓰는 source만 추출합니다. source 이름은 `graph_<model>` 또는 `desc_<model>`입니다.
 
 ```bash
-python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_core.md --model qwen3vl_2b --arm graph_qwen3vl_2b
-python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_core.md --model qwen3vl_4b --arm graph_qwen3vl_4b
-python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_extended.md --model qwen3vl_8b --arm graph_qwen3vl_8b
-python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_description_v3.md --model qwen3vl_2b --arm desc_qwen3vl_2b
+# Main: 온디바이스 Qwen3-VL
+python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" \
+  --model qwen3vl_2b --schema prompts/scene_graph_v9_core.md
+python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$DATASET" \
+  --model qwen3vl_2b --schema prompts/scene_description_v3.md
+
+# 추가 실험: Gemini
+python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" \
+  --model gemini --schema prompts/scene_graph_v9_core.md
 ```
 
-| YAML source | 추출 명령 | `--model` | `--arm` |
-| --- | --- | --- | --- |
-| `metadata` | 필요 없음 | — | — |
-| `graph_qwen3vl_2b` | `extract-graph-scenes` | `qwen3vl_2b` | `graph_qwen3vl_2b` |
-| `desc_qwen3vl_2b` | `extract-description-scenes` | `qwen3vl_2b` | `desc_qwen3vl_2b` |
-| `graph_qwen3vl_4b` | `extract-graph-scenes` | `qwen3vl_4b` | `graph_qwen3vl_4b` |
-| `desc_qwen3vl_4b` | `extract-description-scenes` | `qwen3vl_4b` | `desc_qwen3vl_4b` |
-| `graph_qwen3vl_8b` | `extract-graph-scenes` | `qwen3vl_8b` | `graph_qwen3vl_8b` |
-| `desc_qwen3vl_8b` | `extract-description-scenes` | `qwen3vl_8b` | `desc_qwen3vl_8b` |
-| `graph_gemini` | `extract-graph-scenes` | `gemini` | `graph_gemini` |
-| `desc_gemini` | `extract-description-scenes` | `gemini` | `desc_gemini` |
+- `--model`은 `qwen3vl_2b`, `qwen3vl_4b`, `qwen3vl_8b`, `gemini` 중 하나입니다.
+- `--schema`는 [prompts/](prompts/)의 프롬프트 파일입니다.
+  - Graph: `scene_graph_v8.md`, `v8_2`, `v9_core`, `v9_extended`, `v10_core`, `v10_extended`
+  - Description: `scene_description_v3.md`
+- 로컬 Qwen에서만 쓰는 생성 옵션이 있습니다: `--presence-penalty`, `--repetition-penalty`, `--stop-repeated-lines`. 자세한 내용은 [장면 추출](docs/scene_extraction.md#qwen-생성-정책과-옵션)을 참고하세요.
+- 결과는 `artifacts/runs/<RUN_ID>/<dataset>/extraction/<source>/`에 저장됩니다.
 
-Gemini도 표의 model·source로 추출하고 YAML의 `source`에 같은 값을 명시하면 추천에 연결됩니다. Graph·Description의 `--schema`는 각각 위 프롬프트를 지정합니다. 생성 옵션과 출력 예시는 [장면 추출](docs/scene_extraction.md)을 참고하세요.
-
-장면 결과는 `<artifacts_root>/runs/<RUN_ID>/<dataset>/extraction/<source>/`에 저장합니다. 기존 `extraction/scenes/<source>/` 결과를 재사용하려면 source 폴더 전체를 새 위치로 옮깁니다.
-
-### 3. 고정 특징과 활동 구간 준비
+### 3. 특징과 모듈 준비 (Step 2–3)
 
 ```bash
 python -m validation embed-representations --run-id "$RUN_ID" --dataset "$DATASET"
 python -m validation prepare-module --run-id "$RUN_ID" --dataset "$DATASET"
 ```
 
-특징은 같은 source에 대해 한 번 준비합니다. `prepare-module`은 `ASHA`(activity_hypergraph)를 사용하는 Graph source의 활동 구간만 준비하고, 해당 모듈이 없으면 정상 종료합니다. 활동 구간 준비는 VLM·BGE를 다시 실행하지 않습니다.
+- `embed-representations`는 실험 목록이 쓰는 source마다 BGE 특징을 한 번 계산합니다.
+- `prepare-module`은 `ASHA`를 쓰는 실험의 행동 구간 파일을 만듭니다. 해당 실험이 없으면 아무것도 하지 않습니다.
 
-`segments` 변형은 기본 `scene_segments.npy` 옆에 `scene_segments.<변형>-s<seed>.npy`로 따로 저장되며 기본 파일은 바꾸지 않습니다. 출력 통계의 `identical_to_default_fraction`(기본 구간과 멤버가 완전히 같은 구간의 비율)과 `mean_best_jaccard_with_default`가 1에 가까우면 그 변형은 기본 ASHA와 사실상 같으므로, 학습 전에 비교할 가치가 있는지 확인하세요.
-
-### 4. 추천 학습과 결과 진단
+### 4. 추천 학습과 진단 (Step 4)
 
 ```bash
 python -m validation run-recommendation --run-id "$RUN_ID" --dataset "$DATASET" --workers-per-gpu 1
 python -m validation run-diagnosis --run-id "$RUN_ID" --dataset "$DATASET"
 ```
 
-각 명령은 독립 단계입니다. 앞 단계의 성공을 확인한 뒤 다음 명령을 실행하세요. 추천 명령은 특징·활동 구간 준비나 진단을 자동 실행하지 않습니다.
+- 실험 × seed 조합마다 SASRec을 따로 학습합니다.
+  - `--workers-per-gpu`는 GPU 하나에서 동시에 학습할 조합 수입니다.
+  - GPU가 없으면 1로 두고 CPU에서 학습합니다.
+- `run-diagnosis`는 test 지표를 모으고, 모든 실험 쌍에 대해 paired bootstrap(Bonferroni 보정)을 계산합니다.
+- 다른 Run과 비교하려면 `--compare-run-id <다른 RUN_ID>`를 붙입니다. 두 Run의 cohort 이벤트와 분할이 같아야 합니다.
 
-GPU는 `CUDA_VISIBLE_DEVICES`로 선택합니다. Qwen은 GPU별 추론 엔진을, 추천은 `--workers-per-gpu`개 독립 학습 작업을 실행합니다. 추천은 보이는 GPU가 없으면 worker 수 1에서 CPU로 실행할 수 있습니다. 시작 로그에는 실험 설정 파일·해석된 구성·`deterministic` 적용값을 표시합니다.
+## 결과 확인과 재실행
 
-## 결과 확인과 해석
+`<run-root>`는 `artifacts/runs/<RUN_ID>/<dataset>/`이고, `<experiment-set>`은 실험 label을 순서대로 밑줄로 이은 이름입니다.
 
-`<run-root>`는 `<artifacts_root>/runs/<RUN_ID>/<dataset>/`입니다. `<experiment-set>`은 YAML의 label을 순서대로 밑줄로 연결한 이름입니다.
-
-| 확인할 내용 | `<run-root>` 아래 위치 |
+| 내용 | 위치 |
 | --- | --- |
-| 실험별 checkpoint·학습 기록·이벤트 지표·영상 벡터 | `validation/recommendations/seed_<seed>/<label>/` |
-| 최종 지표·실험 정의·통계·검증 판정 | `validation/diagnosis/<experiment-set>/diagnosis.json` |
-| 사람이 읽는 진단 보고서 | `reports/<experiment-set>/report.md` |
-| 실제 입력·분할·고정 특징의 근거 | `validation/cohort/`, `validation/representations/<source>/` |
+| 진단 보고서 (사람이 읽는 표) | `<run-root>/reports/<experiment-set>/report.md` |
+| 최종 지표·통계 (JSON) | `<run-root>/validation/diagnosis/<experiment-set>/diagnosis.json` |
+| 조합별 checkpoint·학습 기록·이벤트별 지표 | `<run-root>/validation/recommendations/seed_<seed>/<label>/` |
+| 장면 추출 결과 | `<run-root>/extraction/<source>/<content_id>.jsonl` |
+| 분할과 고정 특징 | `<run-root>/validation/cohort/`, `<run-root>/validation/representations/<source>/` |
 
-최종 test 점수는 진단의 `recommendations.means`에서 확인합니다. seed별 값과 표본 표준편차, metadata 기준 상대 변화율, source·modules·readout과 파라미터 수도 보고합니다. `training.json`의 epoch별 validation HR@10은 최종 test 점수와 구분합니다.
+재실행 규칙은 단순합니다.
 
-사용자별 마지막 두 상호작용을 validation/test로 보류하고, validation HR@10으로 checkpoint를 선택한 뒤 test를 한 번 평가합니다. NDCG@10은 사용자별 seed 평균에 paired bootstrap을 적용하며 설정된 모든 실험 쌍에 Bonferroni 보정합니다. HR@10은 기술통계입니다. 실험이 N개이고 seed가 S개이면 SN개 학습·N(N−1)/2쌍 비교를 수행합니다. 위 초기 예시는 3개 seed에서 15개 학습·10쌍 비교입니다.
+- 결과 파일이 있으면 완료로 보고 건너뜁니다.
+  - 장면: 정상 장면
+  - 특징: `manifest.json`
+  - 추천: `complete.json`
+- 설정·코드·프롬프트를 바꾼 뒤 다시 만들려면 해당 단계를 `--force`로 실행하거나 새 `RUN_ID`를 씁니다.
+- 장면 추출에서는 누락·실패·경고 장면만 다시 생성합니다.
+- 다른 Run에서 같은 조건으로 만든 특징과 학습 결과가 있으면 `artifacts/shared_cache/`에서 복사해 재사용합니다.
 
-보고서의 비교는 기록된 구성 전체의 차이입니다. source·인코딩·장면 확보율·파라미터 수가 함께 달라지면 개별 모듈만의 효과로 단정할 수 없습니다. `runtime_decision.status: pass`는 실행 증거의 검증 통과이며 추천 성능 향상 판정이 아닙니다. 통계와 모델 해석은 [학습·평가](docs/graph_training.md#평가와-결과-해석)를 참고하세요.
+자세한 규칙은 [실행·저장 규칙](docs/runtime.md#재실행과-캐시)에 있습니다.
 
-동일한 실험 정의·사용자·이벤트·catalog·분할·seed·평가 계약의 Run은 진단 명령에 `--compare-run-id <reference-run-id>`를 추가해 비교할 수 있습니다.
+## 실험 구성
 
-## 재실행과 재현성
+`rec_experiments_config.yaml`의 각 항목이 추천 실험 하나입니다. validation 명령은 이 파일의 실험을 모두 목록 순서대로 처리합니다.
 
-| 상황 | 처리 |
+```yaml
+experiments:
+  - label: base                # 결과 디렉터리 이름
+    source: metadata           # 제목만 사용
+  - label: graph
+    source: graph_qwen3vl_2b   # 추출한 source
+  - label: graph+REAF+ASHA
+    source: graph_qwen3vl_2b
+    modules: [REAF, ASHA]
+```
+
+| 필드 | 값 |
 | --- | --- |
-| 정상 장면 | 생성 설정을 바꾸어도 재사용 |
-| 누락·실패·Graph warning 장면 | 같은 추출 명령에서 현재 설정으로 한 번씩 재시도 |
-| 완료된 추천 조합 | 입력·실험 정의·학습·평가 조건을 검증한 뒤 재사용 |
-| 미완료 추천 조합 | 처음부터 다시 학습. epoch 중간 재개는 지원하지 않음 |
-| 다른 실험 추가·삭제 | 정의가 같은 기존 실험과 공통 source 특징은 재사용 가능 |
-| 같은 label의 구성 변경 | 기존 결과와 충돌하면 새 Run ID 필요. `--force`로 우회 불가 |
+| `label` | 영문·숫자로 시작하고 영문·숫자·`_ + . -`만 사용. 대소문자 무시 중복 불가 |
+| `source` | `metadata`, 또는 `graph_`·`desc_` 뒤에 `qwen3vl_2b`·`qwen3vl_4b`·`qwen3vl_8b`·`gemini` |
+| `modules` | Graph source에서만 사용. `REAF`(역할 결합), `GNN_ATTN`(영상 내 장면 attention), `ASHA`(행동 구간 Hypergraph). 여러 개 조합 가능 |
+| `segments` | (선택, `ASHA` 필요) 구간 ablation: `action_bag`, `time_window`, `random` |
+| `segments_seed` | (선택) `segments` 변형의 난수 seed. 기본 0 |
 
-추출의 `--force`는 해당 source의 정상 결과까지 재생성합니다. 특징·추천의 `--force`는 캐시 읽기를 우회하므로 결과를 보존하려면 새 Run ID를 사용하세요. label 변경은 저장 경로·결과 식별도 바꾸며 기존 결과를 새 이름으로 자동 변환하지 않습니다. 단계별 규칙은 [저장·재사용 계약](docs/runtime.md#재실행과-캐시)을 참고하세요.
+- 모든 실험은 제목 특징을 함께 씁니다.
+- `metadata` 실험이 있으면 보고서의 상대 변화율 기준이 됩니다.
+- 모듈은 목록 순서와 관계없이 REAF → Scene MLP → GNN_ATTN → ASHA → 영상 평균 순서로 적용합니다.
+- 수식과 설계는 [인코더·모듈·학습·평가](docs/graph_training.md)에 있습니다.
 
-`validation.model.deterministic: true`는 각 실험·seed의 난수 초기화와 PyTorch 결정적 연산을 적용합니다. 같은 입력·seed·환경에서 반복 실행의 수치 변동을 줄이지만 서로 다른 seed나 하드웨어·라이브러리 버전 간 동일 결과까지 보장하지 않습니다. 기준 모델과 모듈 추가 모델은 같은 설정으로 비교하고 여러 seed를 유지합니다. 재사용된 결과의 일치는 재학습 반복 검증과 구분해야 합니다.
+## 테스트와 상세 문서
 
-## 모델 구조 요약과 상세 문서
+CPU에서 작은 가짜 데이터로 전처리부터 진단까지 실행하는 회귀 테스트입니다. GPU나 실제 모델은 쓰지 않습니다.
 
-| 입력·선택 모듈 | 추천 모델에서의 역할 |
+```bash
+pip install -r requirements-dev.txt
+CUDA_VISIBLE_DEVICES='' python -m pytest -q tests
+```
+
+| 문서 | 내용 |
 | --- | --- |
-| metadata | 제목 특징 → 투영·Residual MLP → 영상 벡터 |
-| Description | 제목·장면 문단 특징 → 투영·Residual Scene MLP → 장면 평균 |
-| Graph | 제목·Entity·Action·Context 특징 → 투영·장면 내부 평균 → Residual Scene MLP |
-| `REAF` (`role_fusion`) | Scene MLP 앞에서 역할별 Entity를 Action에 결합 |
-| `GNN_ATTN` (`scene_attention`) | Scene MLP 뒤에서 같은 영상의 장면끼리 단일 head attention으로 정보를 교환 |
-| `ASHA` (`activity_hypergraph`) | Scene MLP 뒤에서 장면–활동 구간 전달과 구간 기여를 적용 |
-| 공통 추천기 | 이력 영상 벡터 → SASRec·User MLP → 후보 영상 벡터와 내적 |
+| [장면 추출](docs/scene_extraction.md) | 장면 스키마, 출력 예시, 파싱 규칙, Qwen/Gemini 옵션 |
+| [인코더·모듈·학습·평가](docs/graph_training.md) | 모델 수식, 결측 처리, 평가 규칙 |
+| [실행·저장 규칙](docs/runtime.md) | 데이터 입력, 산출물 경로, 재실행과 캐시 |
+| [프롬프트 변경 이력](prompts/update_note.md) | 프롬프트 버전별 변경 의도 |
 
-모듈 목록 순서와 무관하게 역할 결합 → Scene MLP → 장면 attention 교환 → 활동 Hypergraph → 영상 집계 순서로 적용합니다. 장면 내부 Entity ID는 영상 간 공유 노드가 아니며, 장면 간 동일 개체 추적이나 명시적 사건 관계는 구현하지 않습니다. SASRec의 사용자 시청 순서와 영상 내부 장면 관계는 구분합니다.
-
-| 상세 문서 | 내용 |
-| --- | --- |
-| [장면 추출](docs/scene_extraction.md) | 장면·스키마·출력 예시·파싱 한계·Qwen/Gemini 옵션 |
-| [인코더·모듈·학습·평가](docs/graph_training.md) | 수식·초기 구성 그림·결측 처리·평가 규칙·설계 배경 |
-| [실행·저장 계약](docs/runtime.md) | 데이터 입력·산출물·캐시·재시도·마이그레이션 |
-| [프로젝트 이정표](docs/TODO.md) | 구현 상태와 실험·후속 검토 기록 |
-| [프롬프트 변경 이력](prompts/update_note.md) | 프롬프트 버전과 변경 의도 |
-
-CPU·오프라인 검증은 `python -m pytest -q tests`로 실행합니다. 이는 수식·저장·작은 데이터 실행 경로의 회귀 검사이며, 실제 관측의 시각적 정확도·CUDA 처리량·전체 데이터 성능 우위는 별도 검증이 필요합니다.
+논문 그림(`WWW2027/figures/`)은 `python docs/design/generate_hgvrec_figures.py`로 다시 만들 수 있습니다. 이 스크립트에는 `python-pptx`, `pymupdf`, LibreOffice가 추가로 필요합니다.

@@ -9,7 +9,7 @@ import subprocess
 
 from tqdm import tqdm
 
-from artifact_io import atomic_write_jsonl, file_fingerprint, write_json, write_jsonl
+from artifact_io import atomic_write_jsonl, write_json, write_jsonl
 from preparation.catalog import content_id_for_item, normalize_item_id
 
 
@@ -152,13 +152,8 @@ def prepare_m3l_cohort(context, *, plan_only=False):
         name: root / "metadata" / name
         for name in ("ratings.dat", "movies.dat", "id_mmrec_to_grouplens.tsv")
     }
-    identities = {
-        name: {"path": str(path), "sha256": file_fingerprint(path)}
-        for name, path in sources.items()
-    }
+    identities = {name: {"path": str(path)} for name, path in sources.items()}
     movies = load_mapping(sources["id_mmrec_to_grouplens.tsv"])
-    if len(movies) != context.source_counts["item_count"]:
-        raise ValueError("M3L mapping cardinality mismatch")
     titles = load_movie_titles(sources["movies.dat"])
     if movies - titles.keys():
         raise ValueError("movies.dat lacks mapped M3L titles")
@@ -175,7 +170,7 @@ def prepare_m3l_cohort(context, *, plan_only=False):
         nonlocal raw_count, kept_count
         for row in tqdm(
             iter_ratings(sources["ratings.dat"], movies),
-            total=context.source_counts["interaction_count"],
+            total=context.source_counts.get("interaction_count"),
             desc="Read M3L ratings",
             unit="rating",
         ):
@@ -189,17 +184,8 @@ def prepare_m3l_cohort(context, *, plan_only=False):
             items.add(row["item_id"])
             yield {"event_id": kept_count, **row}
             kept_count += 1
-        observed = {
-            "user_count": len(raw_users),
-            "interaction_count": raw_count,
-            "item_count": len(raw_items),
-        }
-        if observed != context.source_counts:
-            raise ValueError(f"M3L source cardinality mismatch: {observed}")
 
     atomic_write_jsonl(directory / "events.jsonl", rows(), durable=True)
-    if any(file_fingerprint(path) != identities[name]["sha256"] for name, path in sources.items()):
-        raise RuntimeError("M3L metadata changed during preparation")
     inventory = [row for row in inventory if row["item_id"] in items]
     required = [
         {"item_id": item, "content_id": content_id_for_item(item, "m3l_10m")}
@@ -210,11 +196,11 @@ def prepare_m3l_cohort(context, *, plan_only=False):
     plan = {
         "schema_version": SCHEMA,
         "dataset": context.dataset,
-        "experiment_config_version": context.config["experiment_config_version"],
         "metadata_missing_policy": context.config["validation"]["cohort"][
             "metadata_missing_policy"
         ],
-        "source_counts": context.source_counts,
+        "source_counts": {"user_count": len(raw_users), "interaction_count": raw_count,
+                          "item_count": len(raw_items)},
         "sources": identities,
         "rating_policy": "all_ratings",
         "missing_video_policy": "exclude_item_and_interactions",
@@ -226,7 +212,6 @@ def prepare_m3l_cohort(context, *, plan_only=False):
         "no_history_count": len(users),
         "excluded_item_count": len(excluded),
         "excluded_interaction_count": raw_count - kept_count,
-        "events_sha256": file_fingerprint(directory / "events.jsonl"),
     }
     write_json(directory / "cohort_plan.json", plan)
     write_jsonl(directory / "required_items.jsonl", required)

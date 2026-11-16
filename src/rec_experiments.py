@@ -1,4 +1,4 @@
-"""Validated recommendation definitions, loaded once per validation invocation."""
+"""Recommendation definitions from rec_experiments_config.yaml, loaded once per invocation."""
 
 from pathlib import Path
 import re
@@ -7,13 +7,9 @@ import yaml
 
 CONFIG_PATH = Path("rec_experiments_config.yaml")
 CONFIG_KEY = "_rec_experiments"
-MODULE_VERSIONS = {
-    "role_fusion": "role-fusion/v1",
-    "scene_attention": "gnn-attn/v1",
-    "activity_hypergraph": "segments-v1",
-}
-# Names written in rec_experiments_config.yaml. Results keep the internal names
-# above in their identity, so renaming config entries never invalidates a Run.
+# Internal module names in canonical application order.
+MODULES = ("role_fusion", "scene_attention", "activity_hypergraph")
+# Names written in rec_experiments_config.yaml.
 MODULE_ALIASES = {
     "REAF": "role_fusion",
     "GNN_ATTN": "scene_attention",
@@ -25,36 +21,24 @@ MODULE_DISPLAY_NAMES = {internal: name for name, internal in MODULE_ALIASES.item
 
 
 def display_definition(definition):
-    """Copy of a recorded definition with config module names, for logs and reports only.
-
-    Identities keep the internal names, so recorded results stay valid.
-    """
-    rename = lambda name: MODULE_DISPLAY_NAMES.get(name, name)
-    return {**definition, "modules": [rename(m) for m in definition["modules"]],
-            "module_versions": {rename(m): v for m, v in definition["module_versions"].items()}}
+    """Copy of a recorded definition with config module names, for logs and reports."""
+    return {**definition, "modules": [MODULE_DISPLAY_NAMES.get(m, m) for m in definition["modules"]]}
 
 
 def parse_experiments(value):
     from arm_registry import generation_registry
 
-    if not isinstance(value, dict) or set(value) - {"version", "defaults", "experiments"}:
-        raise ValueError("recommendation config requires version, optional defaults, and experiments")
-    if type(value.get("version")) is not int or value["version"] != 1:
-        raise ValueError("recommendation config version must be 1")
-    defaults = value.get("defaults", {})
-    if not isinstance(defaults, dict) or set(defaults) - {"readout"}:
-        raise ValueError("defaults allows only readout; source must be explicit in every experiment")
-    if defaults.get("readout", "mean") != "mean":
-        raise ValueError("readout must be mean")
+    if not isinstance(value, dict):
+        raise ValueError("recommendation config must be a mapping with an experiments list")
+    defaults = value.get("defaults") or {}
     experiments = value.get("experiments")
     if not isinstance(experiments, list) or not experiments:
         raise ValueError("experiments must be a non-empty list")
-    sources = generation_registry({})
+    sources = generation_registry()
     names, result = set(), []
     for row in experiments:
-        if not isinstance(row, dict) or set(row) - {"label", "source", "modules", "readout",
-                                                     "segments", "segments_seed"}:
-            raise ValueError("experiment allows only label, source, modules, readout, segments, segments_seed")
+        if not isinstance(row, dict):
+            raise ValueError("each experiment must be a mapping")
         name = row.get("label")
         # Labels name result directories: only keep characters that are safe in a path.
         if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_+.-]*", name) is None:
@@ -70,22 +54,18 @@ def parse_experiments(value):
         if not isinstance(modules, list) or any(not isinstance(m, str) for m in modules):
             raise ValueError(f"{name}: modules must be a list of module names")
         modules = [MODULE_ALIASES.get(m, m) for m in modules]
-        if len(set(modules)) != len(modules) or set(modules) - MODULE_VERSIONS.keys():
+        if len(set(modules)) != len(modules) or set(modules) - set(MODULES):
             raise ValueError(f"{name}: modules must be unique supported module names "
                              f"({', '.join(MODULE_ALIASES)})")
         if modules and (source == "metadata" or sources[source].representation != "graph"):
             raise ValueError(f"{name}: modules are graph-only")
         readout = row.get("readout", defaults.get("readout", "mean"))
-        if readout != "mean":
-            raise ValueError(f"{name}: readout must be mean")
         resolved = {"label": name, "source": source,
-                    "modules": [m for m in MODULE_VERSIONS if m in modules], "readout": readout}
-        # Omitted segments keep the default ASHA incidence and add nothing to the resolved row,
-        # so existing experiments keep their identity.
+                    "modules": [m for m in MODULES if m in modules], "readout": readout}
         if "segments" in row or "segments_seed" in row:
             resolved["segments"] = parse_segments(name, row, modules)
         result.append(resolved)
-    return {"version": 1, "experiments": result}
+    return {"experiments": result}
 
 
 def parse_segments(name, row, modules):
@@ -123,8 +103,7 @@ def experiment_definition(arm):
     if "segments" in arm.extensions:
         modules.append("activity_hypergraph")
     definition = {"label": arm.name, "source": feature_source(arm), "modules": modules,
-                  "readout": arm.aggregation,
-                  "module_versions": {name: MODULE_VERSIONS[name] for name in modules}}
+                  "readout": arm.aggregation}
     if arm.segments is not None:
         definition["segments"] = {"variant": arm.segments[0], "seed": arm.segments[1]}
     return definition

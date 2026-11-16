@@ -47,7 +47,7 @@ z = mean(h'_s)
 
 비중은 제목이 빠진 장면 내용으로만 정하고, 섞는 값은 Scene MLP 출력입니다. 장면이 1개인 영상은 `h + ReLU(P h + p)`가 되고, 유효 장면이 없는 영상은 기존 제목 fallback을 사용합니다. `W_q`, `W_k`(128×384, bias 없음)는 N(0, (2·384)^-1/2)로 초기화해 학습 시작 시 logit 표준편차가 약 0.5가 되게 합니다. `P`(512×512)는 xavier normal, `p`는 0입니다. 모든 가중치는 `torch.initial_seed() + 20`으로 시드를 정한 전용 generator에서 만들므로, 나머지 파라미터의 초기값은 이 모듈이 없는 같은 seed 모델과 같습니다. 이 모듈은 학습 시작 시점에 장면 평균과 같지 않습니다. 추가 파라미터는 360,960개입니다.
 
-장면 수가 같은 영상끼리 묶어 `[영상 수, n, n]` 행렬로 계산하고, 한 청크의 Σn²가 `chunk_scene_pairs`를 넘지 않게 나눕니다. 예전 실험 코드의 `gnn_attn`(커밋 `bad5f2c`)과 수식·초기 분포가 같습니다. [교환층](../src/validation/graph_model.py) · [그룹 계산](../src/validation/scene_attention.py) · [계약](../src/validation/graph_context.py).
+장면 수가 같은 영상끼리 묶어 `[영상 수, n, n]` 행렬로 계산하고, 한 청크의 Σn²가 `chunk_scene_pairs`를 넘지 않게 나눕니다. 예전 실험 코드의 `gnn_attn`(커밋 `bad5f2c`)과 수식·초기 분포가 같습니다. [교환층·그룹 계산](../src/validation/graph_model.py).
 
 ## activity_hypergraph
 
@@ -63,9 +63,9 @@ z = mean(h'_s) + gate_video * W_v mean(u_k)
 
 구간에 속하지 않는 장면은 갱신하지 않습니다. 구간 기여는 구간별 동일 가중치 평균이며, 두 게이트는 0에서 시작하는 학습 가능한 스칼라입니다. 구간이 없는 영상은 장면 평균을 사용합니다. Scene MLP 출력이 모듈의 입력이며, `scene_attention`이 함께 있으면 교환 뒤의 장면 벡터가 입력입니다. 영상 노드는 만들지 않습니다.
 
-구간은 `<source>` 특징 디렉터리의 `scene_segments.npy`·`scene_segments.json`으로 준비합니다. 구간 계약은 `scene-segments/v2`이며 입력 해시·생성 코드 해시·checksum을 검증하고 추천 identity에 포함합니다. source가 같으면 여러 실험이 구간 파일을 공유합니다. 준비는 VLM·BGE 재추론 없이 수행합니다.
+구간은 `<source>` 특징 디렉터리의 `scene_segments.npy`·`scene_segments.json`으로 준비합니다. `scene_segments.json`에는 만들 때의 특징 bundle 입력 해시를 적어 두며, 특징을 다시 만든 뒤에는 `prepare-module --force`로 구간을 다시 만들어야 합니다. source가 같으면 여러 실험이 구간 파일을 공유합니다. 준비는 VLM·BGE 재추론 없이 수행합니다.
 
-활동 키는 문법 분석이나 동의어 병합 결과가 아닙니다. 동일 actor/target이나 시각적 행동 경계를 검증하지 않으므로 Hypergraph를 실제 사건 구조로 단정할 수 없습니다. [구간 생성](../src/validation/scene_segments.py) · [집계 정의](../src/validation/graph_context.py) · [영상 인코더](../src/validation/graph_model.py).
+활동 키는 문법 분석이나 동의어 병합 결과가 아닙니다. 동일 actor/target이나 시각적 행동 경계를 검증하지 않으므로 Hypergraph를 실제 사건 구조로 단정할 수 없습니다. [구간 생성](../src/validation/scene_segments.py) · [영상 인코더](../src/validation/graph_model.py).
 
 ## 공동 학습과 실행 자원
 
@@ -79,7 +79,7 @@ AdamW(`weight_decay=0.1`)와 gradient norm 제한 5.0을 사용합니다. 학습
 
 `validation.graph_execution.chunk_items`, `chunk_nodes`는 chunk 크기를 제한하며 한 영상 내부의 장면은 분할하지 않습니다. `checkpoint: auto`는 GPU 여유 메모리에 따라 activation checkpoint 여부를 정합니다. `chunk_scene_pairs`는 이전 설정 호환을 위해 받지만 현재 모델에서는 사용하지 않습니다. BGE 특징 캐시·chunk·checkpoint는 실행 자원 설정이며, 모델 조합은 추천 실험 YAML에서 정의합니다.
 
-[모델](../src/validation/model.py) · [학습·checkpoint 선택](../src/validation/leave_one_out_recommendation.py) · [공통 optimizer](../src/validation/recommendation.py) · [조기 종료](../src/validation/early_stopping.py).
+[모델](../src/validation/model.py) · [학습·checkpoint 선택·optimizer](../src/validation/leave_one_out_recommendation.py) · [조기 종료](../src/validation/early_stopping.py).
 
 ## 평가와 결과 해석
 
@@ -107,38 +107,6 @@ NDCG@10·HR@10의 seed별 값·평균·표본 표준편차를 보고합니다. m
 
 Hypergraph의 연결 구조와 두 내부 경로의 효과를 각각 분리한 비교는 아닙니다. 파라미터 증가도 포함하며 각 효과를 단순 합산하지 않습니다. 관측·인코딩·학습 결과·후속 가설을 구분하고, 진단 pass를 시각적 grounding이나 추천 성능 개선의 증명으로 해석하지 않습니다.
 
-## 초기 구성의 구조 그림
-
-아래는 초기 설정의 예시입니다. 사용자 정의 조합에 맞춰 자동 갱신되지 않으며, 기존 문서 링크를 위해 이미지 파일명을 유지합니다. [생성 소스](design/generate_graph_arm_diagrams.py).
-
-<details>
-<summary>description — 제목·장면 문단 → Scene MLP → Mean</summary>
-
-![description 구조](design/recsys_diagram_d.png)
-
-</details>
-
-<details>
-<summary>graph — Graph 인코딩 → Scene MLP → Mean</summary>
-
-![graph 구조](design/recsys_diagram_g0.png)
-
-</details>
-
-<details>
-<summary>graph-activity — 활동 Hypergraph 추가</summary>
-
-![graph-activity 구조](design/recsys_diagram_g1.png)
-
-</details>
-
-<details>
-<summary>graph-role-activity — 역할 결합과 활동 Hypergraph</summary>
-
-![graph-role-activity 구조](design/recsys_diagram_g2.png)
-
-</details>
-
 ## 설계 배경과 과거 구조 대응
 
 이전 연구실 자문의 모듈 번호는 당시 논의의 구분이며 현재 실행 단계나 YAML 모듈 목록과 같지 않습니다.
@@ -155,4 +123,4 @@ graph-role-activity의 계산·초기화 기준은 과거 `clab-insight`의 `hyp
 
 장면 간 개체·사건 관계, 영상 간 노드 공유·어휘 정규화, 다른 GNN 구조나 사용자 모델 비교는 현행 구현과 구분되는 후속 검토입니다. [프로젝트 이정표](TODO.md)의 구현 상태와 실험 기록을 참고하세요.
 
-CPU·가짜 BGE 검증은 수식·gradient·장면/영상 경계·fallback·소규모 실행과 캐시·진단을 점검합니다. 실제 추출의 시각적 정확도, CUDA 처리량과 전체 데이터 성능 우위는 별도 실험으로 확인해야 합니다. 저장·재현성 규칙은 [실행·저장 계약](runtime.md)을 참고하세요.
+CPU·가짜 BGE 검증은 수식·gradient·장면/영상 경계·fallback·소규모 실행과 캐시·진단을 점검합니다. 실제 추출의 시각적 정확도, CUDA 처리량과 전체 데이터 성능 우위는 별도 실험으로 확인해야 합니다. 저장·재현성 규칙은 [실행·저장 규칙](runtime.md)을 참고하세요.

@@ -15,7 +15,7 @@ from validation.leave_one_out_recommendation import (
     run_combination,
     transition_loss,
 )
-from validation.metrics import metrics_from_rank
+from validation.leave_one_out_data import metrics_from_rank
 from validation.steps import validation_config
 
 pytestmark = pytest.mark.torch

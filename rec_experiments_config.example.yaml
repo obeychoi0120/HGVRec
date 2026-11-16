@@ -1,0 +1,44 @@
+# Recommendation experiments. Copy to rec_experiments_config.yaml (git-ignored) and edit per Run:
+#   cp rec_experiments_config.example.yaml rec_experiments_config.yaml
+#
+# Each experiment trains one SASRec model per seed (validation.model.seeds in config.yaml).
+#   label   : result directory name; letters, digits and _ + . - only
+#   source  : metadata (titles only) or an extraction source graph_<model> / desc_<model>,
+#             where <model> is qwen3vl_2b, qwen3vl_4b, qwen3vl_8b or gemini
+#   modules : optional, graph sources only
+#             REAF     role-aware entity/action fusion
+#             GNN_ATTN scene attention exchange within a video
+#             ASHA     activity segments (scene hypergraph); needs `python -m validation prepare-module`
+#   segments: optional ASHA ablation incidence: action_bag | time_window | random (+ segments_seed)
+
+defaults:
+  readout: mean
+
+experiments:
+  - label: base
+    source: metadata
+    modules: []
+
+  - label: description
+    source: desc_qwen3vl_2b
+    modules: []
+
+  - label: graph
+    source: graph_qwen3vl_2b
+    modules: []
+
+  - label: graph+ASHA
+    source: graph_qwen3vl_2b
+    modules: [ASHA]
+
+  - label: graph+REAF
+    source: graph_qwen3vl_2b
+    modules: [REAF]
+
+  - label: graph+GNN_ATTN
+    source: graph_qwen3vl_2b
+    modules: [GNN_ATTN]
+
+  - label: HGVRec
+    source: graph_qwen3vl_2b
+    modules: [REAF, ASHA]

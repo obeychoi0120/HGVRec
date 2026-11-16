@@ -10,7 +10,7 @@
 
 | 표현 | 프롬프트 | 추출 결과 |
 | --- | --- | --- |
-| Graph | [scene_graph_v9_2b.md](../prompts/scene_graph_v9_2b.md) · [scene_graph_v9_8b.md](../prompts/scene_graph_v9_8b.md) | 장면별 Context·Entities·Actions |
+| Graph | [scene_graph_v9_core.md](../prompts/scene_graph_v9_core.md) · [scene_graph_v9_extended.md](../prompts/scene_graph_v9_extended.md) | 장면별 Context·Entities·Actions |
 | Description | [scene_description_v3.md](../prompts/scene_description_v3.md) | 장면별 관측 문단 |
 
 Graph는 `graph_qwen3vl_2b`·`graph_qwen3vl_4b`·`graph_qwen3vl_8b`·`graph_gemini`, Description은 `desc_qwen3vl_2b`·`desc_qwen3vl_4b`·`desc_qwen3vl_8b`·`desc_gemini` source에 저장합니다. 2B·4B·8B는 별도 source이므로 한 Run에서 함께 추출할 수 있습니다. 생성 명령에는 `--schema`, `--model`, `--arm`이 필요합니다. 상대 프롬프트 경로는 저장소 루트 기준이며 기존의 비어 있지 않은 Markdown 파일을 지정합니다.
@@ -85,7 +85,7 @@ warning 장면은 원문 또는 그래프를 보존하지만 BGE 임베딩과 Gr
 
 ## Qwen 생성 정책과 옵션
 
-CLI 모델 식별자 `qwen3vl_2b`·`qwen3vl_4b`·`qwen3vl_8b`는 각각 Qwen3-VL 2B·4B·8B Instruct checkpoint를 사용합니다. 로컬 checkpoint 경로는 `models.qwen3vl_2b`·`models.qwen3vl_4b`·`models.qwen3vl_8b`에 지정하며, 폴더 이름(또는 `_name_or_path`)에 요청한 크기만 들어 있어야 합니다. 이전 식별자 `qwen3vl`과 `graph_qwen3vl`·`desc_qwen3vl` source는 지원하지 않으므로, 기존 결과를 이어 쓰려면 source 폴더를 생성 당시 크기의 새 이름으로 옮깁니다. Thinking checkpoint는 지원하지 않습니다. Linux/CUDA의 vLLM 실행이며 설치 요구사항은 [pyproject.toml](../pyproject.toml)의 `qwen` extra를 확인하세요.
+CLI 모델 식별자 `qwen3vl_2b`·`qwen3vl_4b`·`qwen3vl_8b`는 각각 Qwen3-VL 2B·4B·8B Instruct checkpoint를 사용합니다. 로컬 checkpoint 경로는 `models.qwen3vl_2b`·`models.qwen3vl_4b`·`models.qwen3vl_8b`에 지정합니다. Linux/CUDA에서 vLLM으로 실행하며, 설치는 [README](../README.md#설치)의 Main 실험 의존성을 따릅니다.
 
 Greedy decoding의 설정은 `do_sample=False`, `temperature=0.0`, `top_p=1.0`, `top_k=0`, `min_p=0.0`입니다. 기본 presence penalty는 Graph 0·Description 1.5, repetition penalty는 Graph 1.05·Description 1.0입니다. 출력 토큰 한도는 `extraction.{graph,description}.{qwen3vl_2b,qwen3vl_4b,qwen3vl_8b}.scene_max_new_tokens`를 따르며 문서에 별도 값으로 복제하지 않습니다.
 
@@ -103,14 +103,14 @@ python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET
 
 옵션은 새로 생성하는 결과와 provenance에 적용됩니다. 기존 정상 장면을 갱신하려면 새 Run 또는 해당 추출의 `--force`를 사용합니다. 생성 정책 변경의 형식 준수율·추천 성능 효과는 별도의 비교가 필요합니다.
 
-엔진 설정 `extraction.qwen`은 GPU 메모리 사용량, 동시 요청, 배치 토큰, context 길이와 prefix caching 등을 제어합니다. 구체적 허용값은 [qwen_config.py](../src/extraction/qwen_config.py)를 따릅니다. 설치 extra `qwen`과 이 설정 이름은 CLI의 `--model qwen3vl_2b`·`qwen3vl_4b`·`qwen3vl_8b`와 구분하며 세 크기에 같은 엔진 설정을 사용합니다.
+엔진 설정 `extraction.qwen`은 GPU 메모리 사용량, 동시 요청, 배치 토큰, context 길이, prefix caching 등을 제어합니다. 값은 [qwen_config.py](../src/extraction/qwen_config.py)의 기본값 위에 덮어쓰며 vLLM `AsyncEngineArgs`에 그대로 전달됩니다. 세 크기에 같은 엔진 설정을 씁니다.
 
 ## Gemini 사용
 
-`gemini` extra를 설치하고 `models.gemini`에 Vertex 프로젝트·위치·모델·생성 설정을 지정합니다. 실행 환경에 ADC 인증과 호출 권한이 필요하며 전체 장면 동시성은 `extraction.gemini.threads`로 정합니다. 로컬 Qwen용 penalty 옵션은 Gemini에 지정할 수 없습니다.
+추가 실험 의존성(`requirements-extra.txt`)을 설치하고 `models.gemini`에 Vertex 프로젝트·위치·모델·생성 설정을 지정합니다. 실행 환경에 ADC 인증(`gcloud auth application-default login`)과 호출 권한이 필요하며 전체 장면 동시성은 `extraction.gemini.threads`로 정합니다. 로컬 Qwen용 penalty 옵션은 Gemini에 지정할 수 없습니다.
 
 ```bash
-python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9.md --model gemini --arm graph_gemini
+python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_core.md --model gemini --arm graph_gemini
 python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_description_v3.md --model gemini --arm desc_gemini
 ```
 
@@ -120,9 +120,7 @@ python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$D
 
 장면은 `<artifacts_root>/runs/<RUN_ID>/<dataset>/extraction/<source>/<content_id>.jsonl`에 저장합니다.
 
-기존 `extraction/scenes/<source>/` 결과를 재사용하려면 source 폴더 전체를 `extraction/<source>/`로 옮깁니다. `generation_identity.json`과 실패·원본 응답 파일도 함께 유지해야 합니다. 기존 폴더는 자동 이동하지 않으며, 새 위치가 이미 있으면 두 결과를 덮어쓰거나 임의로 병합하지 않습니다.
-
-| 행 종류 | compact 필드 |
+| 행 종류 | 필수 필드(추가 필드 허용) |
 | --- | --- |
 | Description | `content_id`, `scene_idx`, `tokens`, `description`, (`TOKEN_LIMIT`일 때만) `warning` |
 | Graph | `content_id`, `scene_idx`, `tokens`, `warning`, `scene_graph` |
@@ -132,4 +130,4 @@ python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$D
 
 진행바는 `success=… repeat_occurred=… parse_failed=… token_limit=… error=…`로 표시하며 합이 완료 수입니다. Description은 `success`, `token_limit`, `error`만 표시합니다. Graph·Description 모두 source 디렉터리의 `generation_stats.json`에 재사용·신규 결과를 합친 같은 키의 집계를 기록합니다. warning·error가 있으면 해당 JSONL의 원문과 태그를 확인합니다. `REPEAT_OCCURRED`는 정상 사용되는 warning이므로 재실행해도 다시 생성하지 않습니다. error가 남으면 CLI는 종료 코드 1을 반환하고 완료된 출력은 보존합니다. warning만 남으면 종료 코드는 0입니다.
 
-정상 장면 재사용, 기존 실패 로그 통합, `generation_identity.json`의 한계는 [실행·저장 계약](runtime.md#장면-저장과-추적-정보)에 설명합니다. 프롬프트 변경 의도와 버전은 [변경 이력](../prompts/update_note.md)을 참고하세요.
+정상 장면 재사용과 `generation_identity.json`의 한계는 [실행·저장 규칙](runtime.md#장면-저장)에 설명합니다. 프롬프트 변경 의도와 버전은 [변경 이력](../prompts/update_note.md)을 참고하세요.

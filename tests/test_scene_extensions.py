@@ -10,10 +10,8 @@ from extraction.scene_storage import write_scene_records
 from helpers import graph, scene_row
 from validation.config import GraphExecutionConfig
 from arm_registry import registry
-from validation.graph_context import EXTENSION_MODELS
 from validation.graph_inputs import load_scene_segments
 from validation.graph_model import GraphSASRec
-from validation.representation_provenance import recommendation_identity
 from validation.scene_segments import attach
 
 pytestmark = pytest.mark.torch
@@ -150,17 +148,11 @@ def test_attach_builds_segments_and_identity_records_them(context, monkeypatch):
     assert result["segments"] == 3 and sorted(map(tuple, pairs.tolist())) == [(0, 0), (1, 0), (1, 1), (2, 1), (3, 2)]
     with pytest.raises(ValueError, match="no segments extension"):
         attach(context, "graph")
-    g1, g2 = (recommendation_identity(context, name) for name in ("graph-activity", "graph-role-activity"))
-    assert g1["experiment_arm"]["extensions"] == ["segments"]
-    assert g1["experiment_arm"]["role_fusion"] is False
-    assert g2["experiment_arm"]["role_fusion"] is True
-    assert g1["scene_segments"] == g2["scene_segments"]
-    assert g2["experiment_arm"]["extensions"] == ["segments"]
-    assert g2["item_model"]["extensions"]["segments"] == EXTENSION_MODELS["segments"]
-    assert g2["scene_aggregation"] == "mean"
-    assert "gcn" not in g2["item_model"]
-    assert g2["item_model"]["extensions"]["segments"]["applied_after"] == "scene_mlp_without_scene_exchange"
-    assert g2["item_model"]["scene_mlp"] is True
+    arms = registry(context.config)
+    g1, g2 = arms["graph-activity"], arms["graph-role-activity"]
+    assert g1.extensions == g2.extensions == ("segments",)
+    assert (g1.role_fusion, g2.role_fusion) == (False, True)
+    assert g2.aggregation == "mean"
 
 
 def test_segment_backbone_rng_and_gates():

@@ -1,87 +1,70 @@
+"""Typed access to config.yaml `validation`; defaults match the main experiments.
+
+Every field is a plain typed value, so sweeps only need a config edit. Extra keys are kept.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
-class DatasetConfig(StrictModel):
-    pairs_tsv: Path
-    videos_dir: Path
-    titles_csv: Path
-    titles_supplement_csv: Path | None = None
-
-
-class LeaveOneOutDatasetConfig(DatasetConfig):
-    pairs_csv: Path
-
-
-class M3LDatasetConfig(StrictModel):
-    root: Path
-
-
-class EncoderConfig(StrictModel):
+class EncoderConfig(Settings):
     model_path: Path
-    embedding_dim: Literal[1024]
-    max_length: Literal[512]
+    embedding_dim: int = 1024
+    max_length: int = 512
     batch_size: int = Field(default=32, gt=0)
 
 
-class ModelConfig(StrictModel):
-    deterministic: bool = Field(default=True, strict=True)
-    max_sequence_length: Literal[10]
-    embedding_dim: Literal[512]
-    num_blocks: Literal[2]
-    num_heads: Literal[2]
-    dropout: float = Field(ge=0, lt=1)
-    batch_size: int = Field(gt=0)
-    max_epochs: int = Field(gt=0)
-    patience: int = Field(gt=0)
-    min_delta: float = Field(default=0.0, ge=0, allow_inf_nan=False)
-    learning_rate: float = Field(gt=0)
-    popularity_power: Literal[1.0]
-    seeds: list[int]
+class ModelConfig(Settings):
+    deterministic: bool = True
+    max_sequence_length: int = Field(default=10, gt=0)
+    embedding_dim: int = Field(default=512, gt=0)
+    num_blocks: int = Field(default=2, gt=0)
+    num_heads: int = Field(default=2, gt=0)
+    dropout: float = 0.1
+    batch_size: int = Field(default=128, gt=0)
+    max_epochs: int = Field(default=50, gt=0)
+    patience: int = Field(default=5, gt=0)
+    min_delta: float = 0.0
+    learning_rate: float = 1e-4
+    popularity_power: float = 1.0
+    seeds: list[int] = Field(default_factory=lambda: [42, 43, 44], min_length=1)
 
     @model_validator(mode="after")
     def validate_model(self) -> "ModelConfig":
-        if len(self.seeds) != 3 or len(set(self.seeds)) != 3:
-            raise ValueError("exactly three distinct model seeds are required")
         if self.embedding_dim % self.num_heads:
             raise ValueError("embedding_dim must be divisible by num_heads")
         return self
 
 
-class EvaluationConfig(StrictModel):
-    checkpoint_metric: Literal["HR@10"]
-    cutoffs: list[int]
-    primary_cutoff: Literal[10]
-    bootstrap_samples: int = Field(gt=0)
-    familywise_alpha: float = Field(gt=0, lt=1)
-    multiple_comparison_correction: Literal["bonferroni"]
-    min_scene_coverage: float = Field(ge=0, le=1)
-    max_arm_coverage_gap: float = Field(ge=0, le=1)
-
-    @model_validator(mode="after")
-    def validate_cutoffs(self) -> "EvaluationConfig":
-        if self.cutoffs not in ([4, 8, 10, 20], [4, 8, 10, 20, 30]):
-            raise ValueError("cutoffs must be [4, 8, 10, 20] with optional @30")
-        return self
+class EvaluationConfig(Settings):
+    checkpoint_metric: str = "HR@10"
+    cutoffs: list[int] = Field(default_factory=lambda: [4, 8, 10, 20, 30])
+    primary_cutoff: int = 10
+    bootstrap_samples: int = Field(default=10000, gt=0)
+    familywise_alpha: float = 0.05
+    multiple_comparison_correction: str = "bonferroni"
+    min_scene_coverage: float = 0.95
+    max_arm_coverage_gap: float = 0.05
 
 
-class FullCohortConfig(StrictModel):
-    mode: Literal["leave_one_out"]
-    metadata_missing_policy: Literal["zero_vector"]
-    timezone: Literal["UTC"]
-    min_user_interactions: Literal[5]
-    retained_sequence_length: Literal[13]
+class CohortConfig(Settings):
+    mode: str = "leave_one_out"
+    metadata_missing_policy: str = "zero_vector"
+    timezone: str = "UTC"
+    min_user_interactions: int = Field(default=5, gt=0)
+    retained_sequence_length: int = Field(default=13, gt=2)
 
 
-class GraphExecutionConfig(StrictModel):
-    # Execution choices only: no change to model weights, loss or cache identity.
+class GraphExecutionConfig(Settings):
+    # Execution choices only: no change to model weights or loss.
     chunk_items: int = Field(default=256, gt=0)
     chunk_nodes: int = Field(default=32768, gt=0)
     # Bounds the sum of squared per-video scene counts in a chunk; used only by scene_attention.
@@ -90,32 +73,41 @@ class GraphExecutionConfig(StrictModel):
     feature_cache_mb: int = Field(default=2048, ge=0)
 
 
-class ValidationConfig(StrictModel):
-    schema_version: Literal["validation-config/v9"]
+class ValidationConfig(Settings):
     run_id: str
-    dataset: LeaveOneOutDatasetConfig | M3LDatasetConfig
-    cohort: FullCohortConfig
+    dataset: dict[str, Any]
+    cohort: CohortConfig = Field(default_factory=CohortConfig)
     encoder: EncoderConfig
-    model: ModelConfig
-    evaluation: EvaluationConfig
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     graph_execution: GraphExecutionConfig = Field(default_factory=GraphExecutionConfig)
     output_dir: Path
 
 
-def build_validation_config(
-    *, run_id, dataset, settings, model_path, output_dir
-) -> ValidationConfig:
-    """Assemble the shared contract after the caller resolves its own paths."""
+def build_validation_config(*, run_id, dataset, settings, model_path, output_dir) -> ValidationConfig:
+    """Assemble the typed settings after the caller resolves its own paths."""
     return ValidationConfig.model_validate(
         {
-            "schema_version": "validation-config/v9",
             "run_id": run_id,
             "dataset": dataset,
-            "cohort": settings.get("cohort"),
-            "encoder": {**settings["encoder"], "model_path": model_path},
-            "model": settings.get("model"),
-            "evaluation": settings.get("evaluation"),
-            "graph_execution": settings.get("graph_execution", {}),
+            "cohort": settings.get("cohort") or {},
+            "encoder": {**(settings.get("encoder") or {}), "model_path": model_path},
+            "model": settings.get("model") or {},
+            "evaluation": settings.get("evaluation") or {},
+            "graph_execution": settings.get("graph_execution") or {},
             "output_dir": output_dir,
         }
+    )
+
+
+def validation_config(context) -> ValidationConfig:
+    from rec_experiments import load_experiments
+
+    load_experiments(context)
+    return build_validation_config(
+        run_id=context.run_id,
+        dataset={key: context.path("data", key) for key in context.data},
+        settings=context.config["validation"],
+        model_path=context.path("models", "bge"),
+        output_dir=context.run_root,
     )

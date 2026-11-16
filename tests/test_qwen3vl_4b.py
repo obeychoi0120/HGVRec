@@ -45,15 +45,15 @@ def test_qwen3vl_4b_sources_run_extraction_to_diagnosis(context, monkeypatch, ca
     assert not context.scene_arm_dir("graph_qwen3vl_2b").exists()
 
     labels = [row["label"] for row in EXPERIMENTS]
-    command = lambda step: main([step, "--run-id", context.run_id, "--dataset", context.dataset])
+    def command(step):
+        return main([step, "--run-id", context.run_id, "--dataset", context.dataset])
     assert command("embed-representations") == 0
     assert {p.name for p in context.representations_dir.iterdir()} == {
         "metadata", "desc_qwen3vl_4b", "graph_qwen3vl_4b",
     }
     assert command("prepare-module") == 0
     identity = recommendation_identity(context, "graph-4b")
-    assert identity["experiment_arm"]["model"] == "qwen3vl_4b"
-    assert identity["experiment_arm"]["scene_arm"] == "graph_qwen3vl_4b"
+    assert identity["experiment_definition"]["source"] == "graph_qwen3vl_4b"
     assert command("run-recommendation") == 0
     assert len(list(context.recommendations_dir.rglob("complete.json"))) == 3 * len(labels)
     capsys.readouterr()

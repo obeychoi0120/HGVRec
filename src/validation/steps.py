@@ -4,20 +4,10 @@ import json
 
 from pipeline_logging import log_step_start
 from rec_experiments import load_experiments
-from validation.config import build_validation_config
-from validation.recommendation_contracts import resolve_target_arms
+from validation.config import validation_config
+from arm_registry import resolve_target_arms
 
-
-def validation_config(context):
-    load_experiments(context)
-    return build_validation_config(
-        run_id=context.run_id,
-        dataset={key: context.path("data", key) for key in context.data},
-        settings=context.config["validation"],
-        model_path=context.path("models", "bge"),
-        output_dir=context.run_root,
-    )
-
+__all__ = ["validation_config"]
 
 
 def embed_representations(context, *, force=False, target=None):

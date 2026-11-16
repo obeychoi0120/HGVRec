@@ -71,14 +71,14 @@ def test_dataset_isolation_and_m3l_cohort_semantics(context, monkeypatch):
     source.mkdir()
     (source / "x").write_bytes(b"microlens")
     left.publish(source, ["x"], origin={"run_id": context.run_id})
-    assert not right.valid()
-    assert right.restore(context.root / "wrong-cache") is None
+    assert not right.exists()
+    assert not right.restore(context.root / "wrong-cache")
     with pytest.raises(ConfigError, match="unsupported dataset"):
         RunContext.load(context.run_id, dataset="../escape", root=context.root)
 
     # M3L filtering, timestamps, sequences and a frozen catalog.
     ctx = m3l
-    assert validation_config(ctx).dataset.root == ctx.path("data", "root")
+    assert validation_config(ctx).dataset["root"] == ctx.path("data", "root")
     assert prepare_full_cohort(ctx)["status"] == "ready"
     source = ctx.require_ready_cohort()
     assert source["plan"]["source_counts"] == ctx.source_counts

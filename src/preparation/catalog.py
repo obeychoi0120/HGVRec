@@ -26,24 +26,6 @@ def content_id_for_item(item_id: str, dataset: str = "microlens_100k") -> str:
     return f"{dataset}_{int(item_id):05d}"
 
 
-def load_pairs(path: Path) -> list[tuple[str, list[str]]]:
-    users: list[tuple[str, list[str]]] = []
-    seen: set[str] = set()
-    with path.open("r", encoding="utf-8-sig") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            parts = line.rstrip("\r\n").split("\t")
-            if len(parts) != 2 or not parts[0].strip():
-                raise CohortError(f"invalid pairs row {line_number}")
-            user_id = parts[0].strip()
-            if user_id in seen:
-                raise CohortError(f"duplicate user {user_id}")
-            seen.add(user_id)
-            users.append((user_id, [normalize_item_id(item) for item in parts[1].split()]))
-    return users
-
-
 def load_metadata_titles(path: Path, *, keep_blank: bool = False) -> dict[str, str]:
     """Blank titles outside the required catalog do not block preparation."""
     titles: dict[str, str] = {}

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from itertools import chain
 
-from extraction.token_usage import qwen_output_tokens, gemini_output_tokens
-
-from extraction.descriptions import SCENE_SCHEMA_VERSION
+from extraction.scene_storage import gemini_output_tokens, qwen_output_tokens
 from extraction.graph_warnings import REPEAT_OCCURRED, TOKEN_LIMIT, USABLE_OUTCOMES, outcome
 from extraction.semantic_graph import parse_or_repair_graph
 from extraction.generation import generate_penalty_passes
@@ -12,6 +10,9 @@ from extraction.step_support import (
     write_progress,
     write_scene_results,
 )
+
+
+SCENE_SCHEMA_VERSION = "scene-description/v2"
 
 
 def graph_scene_result(row, text, *, error=None, truncated=False, diagnostics=None, repeated=False):

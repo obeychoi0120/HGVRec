@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
@@ -11,16 +10,12 @@ import time
 import numpy as np
 from tqdm import tqdm
 
-from artifact_io import read_json, write_json
-from validation.metrics import metrics_from_rank
+from artifact_io import write_json
+from validation.leave_one_out_data import metrics_from_rank
 from validation.early_stopping import EarlyStopping
 from validation.model import require_torch, save_checkpoint, seed_everything, torch
-from validation.representation_checks import verify_representations
-from validation.recommendation import _optimizer
-from arm_registry import RECOMMENDATION_ARM_CONTRACT
-from validation.recommendation_contracts import ARCHITECTURE_VERSION, EVALUATION_CONTRACT, resolve_target_arms
+from arm_registry import resolve_target_arms
 from validation.leave_one_out_data import EventTable, PROTOCOL
-from preparation.cohort import iter_jsonl
 from validation.selection import load_validation_cohort, training_signature
 from validation.leave_one_out_execution import (
     EXECUTION_VERSION,
@@ -28,6 +23,11 @@ from validation.leave_one_out_execution import (
     masked_ranks,
     negative_mask,
 )
+
+
+def _optimizer(model, config):
+    return torch.optim.AdamW(model.parameters(), lr=config.model.learning_rate, weight_decay=0.1)
+
 
 SCHEMA = "sasrec-leave-one-out-combination/v2"
 
@@ -134,112 +134,17 @@ def combination_dir(context, seed, arm):
     return context.recommendations_dir / f"seed_{seed}" / arm.lower()
 
 
-def result_files(identity):
-    return ["sasrec.pt", "training.json", "per_event_metrics.jsonl", "catalog_vectors.npy"]
-
-
-def ensure_compatible_output(directory, identity):
-    """Never overwrite a different Arm/model, including partial results and force runs."""
-    if not directory.exists() or not any(directory.iterdir()):
-        return
-    keys = ("arm_contract", "architecture_version", "experiment_arm", "item_model", "experiment_definition")
-    evidence = []
-    for name in ("identity.json", "complete.json", "training.json"):
-        path = directory / name
-        if path.exists():
-            try:
-                value = read_json(path)
-                evidence.append(value["identity"] if name == "complete.json" else value)
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
-    if not evidence and (directory / "sasrec.pt").exists():
-        try:
-            evidence.append(torch.load(directory / "sasrec.pt", map_location="cpu",
-                                       weights_only=True)["metadata"])
-        except (OSError, ValueError, KeyError, TypeError, RuntimeError, EOFError):
-            pass
-    if not evidence or any(not isinstance(old, dict) or any(old.get(k) != identity.get(k) for k in keys)
-                           for old in evidence):
-        raise ValueError(f"incompatible recommendation output: {directory}; use a new Run ID "
-                         "to preserve previous results (--force cannot overwrite another architecture)")
-
-
-def combination_complete(directory, identity, expected_count, *, architecture_version=None):
-    if (identity.get("arm_contract") != RECOMMENDATION_ARM_CONTRACT
-            or identity.get("architecture_version") != ARCHITECTURE_VERSION
-            or identity.get("protocol") != PROTOCOL or not identity.get("split_hash")
-            or identity.get("evaluation_contract") != EVALUATION_CONTRACT):
-        return False
-    if architecture_version is None:
-        architecture_version = identity["architecture_version"]
-    try:
-        complete = read_json(directory / "complete.json")
-        schema = complete.get("schema_version")
-        if schema != SCHEMA or any(
-            complete.get("identity", {}).get(key) != value for key, value in identity.items()
-        ):
-            return False
-        if complete.get("event_count") != expected_count:
-            return False
-        names = set(result_files(identity))
-        if not all(
-            (directory / name).is_file() and (directory / name).stat().st_size for name in names
-        ):
-            return False
-        from validation.shared_cache import checksum
-
-        if set(complete.get("checksums", {})) != names or any(
-            checksum(directory / name) != complete["checksums"][name] for name in names
-        ):
-            return False
-        training = read_json(directory / "training.json")
-        if training.get("architecture_version") != architecture_version:
-            return False
-        if training.get("schema_version") != schema or any(
-            training.get(key) != value for key, value in identity.items()
-        ):
-            return False
-        epochs = training.get("train", [])
-        if not epochs or training.get("checkpoint_policy") != "best_validation_hr10":
-            return False
-        if training.get("split", {}).get("split_hash") != identity["split_hash"]:
-            return False
-        if not all(math.isfinite(row["validation_hr10"]) and 0 <= row["validation_hr10"] <= 1 for row in epochs):
-            return False
-        best = max(epochs, key=lambda r: r["validation_hr10"])
-        if training.get("best_epoch") != best["epoch"]:
-            return False
-        seen = set()
-        for row in iter_jsonl(directory / "per_event_metrics.jsonl"):
-            event = row["event_id"]
-            if (
-                row.get("schema_version") != "sasrec-leave-one-out-per-event/v2"
-                or type(event) is not int
-                or event < 0
-                or event in seen
-                or any(row.get(key) != value for key, value in identity.items())
-                or type(row["rank"]) is not int
-                or not 1 <= row["rank"] <= training["catalog_size"]
-                or row["candidate_count"] != training["catalog_size"]
-            ):
-                return False
-            seen.add(event)
-        return len(seen) == expected_count
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return False
+def combination_complete(directory):
+    """Resume rule: a combination is done once its completion marker exists."""
+    return (directory / "complete.json").is_file()
 
 
 def run_combination(
     context, config, table, split, identity, branch, prepared, device,
 ):
-    if identity.get("evaluation_contract") != EVALUATION_CONTRACT:
-        raise ValueError("unsupported recommendation evaluation contract")
-    if identity.get("architecture_version") != ARCHITECTURE_VERSION:
-        raise ValueError("unsupported recommendation architecture")
     ids, probabilities, frequencies = prepared
     seed, arm = (identity[key] for key in ("seed", "arm"))
     directory = combination_dir(context, seed, arm)
-    ensure_compatible_output(directory, identity)
     directory.mkdir(parents=True, exist_ok=True)
     write_json(directory / "identity.json", identity)
     (directory / "complete.json").unlink(missing_ok=True)
@@ -297,8 +202,7 @@ def run_combination(
         if stopping.best_epoch != previous_best:
             save_checkpoint(
                 directory / "sasrec.pt", model,
-                {**identity, "architecture_version": identity["architecture_version"],
-                 "best_epoch": epoch, "catalog_size": len(table.items),
+                {**identity, "best_epoch": epoch, "catalog_size": len(table.items),
                  "checkpoint_policy": "best_validation_hr10"},
             )
         if stopped:
@@ -331,7 +235,6 @@ def run_combination(
     print(f"[Leave-one-out] {arm} seed={seed} test={timings['test']:.2f}s", flush=True)
     metadata = {
         **identity,
-        "architecture_version": identity["architecture_version"],
         "best_epoch": best_epoch,
         "checkpoint_policy": "best_validation_hr10",
         "catalog_size": len(table.items),
@@ -380,23 +283,15 @@ def run_combination(
             },
         },
     )
-    from validation.shared_cache import checksum
-
     write_json(
         directory / "complete.json",
-        {
-            "schema_version": SCHEMA,
-            "identity": identity,
-            "event_count": count,
-            "checksums": {name: checksum(directory / name) for name in result_files(identity)},
-        },
+        {"schema_version": SCHEMA, "identity": identity, "event_count": count},
     )
     # Publish each completed unit, including in spawned workers, so interruption
     # of a later combination does not withhold already finished shared results.
     from validation import recommendation_cache
 
-    if recommendation_cache.eligible(context, branch):
-        recommendation_cache.publish(context, directory, identity, table, split, force=True)
+    recommendation_cache.publish(context, directory)
 
 
 def prepare_split(table, split):
@@ -424,7 +319,7 @@ def worker_devices(workers_per_gpu):
 def run_leave_one_out(
     context, *, force=False, workers_per_gpu=1, target=None,
 ):
-    from validation.steps import validation_config
+    from validation.config import validation_config
     from validation.representation_provenance import recommendation_identity
 
     arms = resolve_target_arms(target, config=context.config)
@@ -433,7 +328,6 @@ def run_leave_one_out(
     config = validation_config(context)
     cohort = load_validation_cohort(context)
     table = EventTable(cohort["events"])
-    verify_representations(context, cohort, arms=arms)
     training_input_hash = training_signature(context, cohort, config)
     completed = skipped = shared = 0
     jobs = []
@@ -444,7 +338,6 @@ def run_leave_one_out(
                 identity = {
                     "run_id": context.run_id,
                     "protocol": PROTOCOL,
-                    "evaluation_contract": dict(EVALUATION_CONTRACT),
                     "split_hash": split["split_hash"],
                     "seed": seed,
                     "arm": arm,
@@ -454,14 +347,10 @@ def run_leave_one_out(
                 }
                 directory = combination_dir(context, seed, arm)
                 combinations.append((directory, identity, branch, split))
-    for directory, identity, _, _ in combinations:
-        ensure_compatible_output(directory, identity)
     for directory, identity, branch, split in combinations:
-        expected_count = len(phase_ids(table, split, "test"))
-        if not force and combination_complete(directory, identity, expected_count):
+        if not force and combination_complete(directory):
             skipped += 1
-        elif (not force and recommendation_cache.eligible(context, branch)
-              and recommendation_cache.restore(context, directory, identity, table, split)):
+        elif not force and recommendation_cache.restore(context, directory, identity):
             shared += 1
             skipped += 1
         else:
@@ -506,9 +395,8 @@ def run_leave_one_out(
                 )
                 completed += 1
                 progress.update(1)
-    for directory, identity, branch, split in combinations:
-        if recommendation_cache.eligible(context, branch):
-            recommendation_cache.publish(context, directory, identity, table, split, force=force)
+    for directory, _, _, _ in combinations:
+        recommendation_cache.publish(context, directory)
     write_json(
         context.recommendations_dir / "reuse.json",
         {

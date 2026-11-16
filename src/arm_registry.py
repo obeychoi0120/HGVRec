@@ -2,9 +2,6 @@
 
 from dataclasses import dataclass
 
-EXPERIMENT_CONFIG_VERSION = "v6"
-RECOMMENDATION_ARM_CONTRACT = "gnn-attn-aggregation/v1"
-
 
 @dataclass(frozen=True)
 class Arm:
@@ -29,16 +26,12 @@ SOURCES = tuple(
 )
 
 
-def arm_contract(config):
-    return RECOMMENDATION_ARM_CONTRACT
-
-
 def registry(config):
     from rec_experiments import CONFIG_KEY
 
     if CONFIG_KEY not in config:
         raise ValueError("recommendation experiments are not loaded; load rec_experiments_config.yaml first")
-    sources = generation_registry(config)
+    sources = generation_registry()
     result = {}
     for row in config[CONFIG_KEY]["experiments"]:
         source = sources.get(row["source"])
@@ -62,9 +55,11 @@ def target_set(config, target):
     return "_".join(select_arms(config, target))
 
 
+def resolve_target_arms(target=None, *, config):
+    return {name: name for name in select_arms(config, target)}
+
+
 def active_arms(config):
-    if "arms" in config.get("protocol", {}):
-        raise ValueError("protocol.arms is not supported; edit rec_experiments_config.yaml")
     return list(registry(config))
 
 
@@ -76,15 +71,15 @@ def select_arms(config, target=None):
     return {name: arm for name, arm in registered.items() if name in names}
 
 
-def generation_registry(config):
+def generation_registry():
     return {arm.name: arm for arm in SOURCES}
 
 
-def generated_arm(config, representation, model):
+def generated_arm(representation, model):
     if model not in GENERATION_MODELS:
         raise ValueError(f"model/source must be one of {', '.join(GENERATION_MODELS)}")
     source = next(
-        (arm for arm in generation_registry(config).values() if arm.representation == representation and arm.model == model),
+        (arm for arm in generation_registry().values() if arm.representation == representation and arm.model == model),
         None,
     )
     if source is None:
@@ -93,7 +88,7 @@ def generated_arm(config, representation, model):
 
 
 def resolve_generation_arm(config, name, representation, model):
-    arm = generation_registry(config).get(name)
+    arm = generation_registry().get(name)
     if arm is None:
         source = registry(config).get(name) if "_rec_experiments" in config else None
         hint = f"; use source --arm {source.scene_arm}" if source and source.scene_arm else ""

@@ -1,13 +1,47 @@
 """Role-aware scene encoding and differentiable video pooling for SASRec."""
 
+import math
+
 import numpy as np
 
 from validation.model import SASRec, SingleLayerResidualMLP, torch, nn
 from validation.graph_inputs import GraphStore
-from validation.graph_context import GRAPH_MODEL, check_extensions
 from validation.graph_batching import PackedGraphStore, GRAPH_EXECUTION_VERSION
 from validation.config import GraphExecutionConfig
-from validation.scene_attention import scene_groups, unit_rms
+
+
+def scene_groups(offsets):
+    """{"scene_group_<n>": [videos with n scenes, n] batch-local scene rows}; videos without scenes are absent."""
+    offsets = np.asarray(offsets, dtype=np.int64)
+    counts = np.diff(offsets)
+    return {
+        f"scene_group_{size}": offsets[:-1][counts == size, None] + np.arange(size)
+        for size in np.unique(counts)
+        if size > 0
+    }
+
+
+def unit_rms(values, eps=1e-8):
+    """Unit L2 direction rescaled to unit RMS; only the attention scores see it.
+
+    Raw scene features have norm ~1, which would give scores near 0 and almost uniform
+    weights for many steps; values are never rescaled.
+    """
+    return nn.functional.normalize(values, dim=-1, eps=eps) * math.sqrt(values.shape[-1])
+
+
+HIDDEN_DIM = 128
+# Optional scene modules: ASHA reads the scene_segments sidecar; GNN_ATTN exchanges scenes within a video.
+EXTENSIONS = frozenset({"segments", "scene_attention"})
+
+
+def check_extensions(extensions, aggregation):
+    extensions = frozenset(extensions)
+    if aggregation != "mean":
+        raise ValueError("scene aggregation must be mean")
+    if extensions - EXTENSIONS:
+        raise ValueError("unknown scene extension: " + ", ".join(sorted(extensions - EXTENSIONS)))
+    return extensions
 
 
 def segment_mean(values, indices, count):
@@ -63,7 +97,7 @@ class SceneRoleEncoder(nn.Module):
 
     ROLE_INDICES = (0, 1, 2, 4)  # actor, target, tool, place; receiver is ignored.
 
-    def __init__(self, feature_dim=1024, hidden=GRAPH_MODEL["hidden_dim"], aggregation="mean",
+    def __init__(self, feature_dim=1024, hidden=HIDDEN_DIM, aggregation="mean",
                  role_fusion=True, extensions=()):
         super().__init__()
         self.extensions = check_extensions(extensions, aggregation)
@@ -220,11 +254,6 @@ class DescriptionSceneEncoder(nn.Module):
             fallback = torch.cat([title[ids], title.new_zeros((len(ids), self.hidden_dim * 3))], -1)
             output = output.index_copy(0, ids, self.scene_mlp(fallback))
         return output.masked_fill(~batch["available"].bool()[:, None], 0.0)
-
-
-def graph_batch(store, item_ids, device):
-    """Standalone mutable batch API; model training reuses a PackedGraphStore."""
-    return PackedGraphStore(store, feature_cache_mb=0).batch(item_ids, device, prepared=False)
 
 
 class GraphSASRec(SASRec):

@@ -1,147 +1,34 @@
 """Cross-run reuse of completed recommendation combinations."""
 
-import json
-import pickle
-import shutil
-import tempfile
-from pathlib import Path
+from artifact_io import fingerprint, read_json, write_json
+from validation.shared_cache import SharedCache
 
-from artifact_io import fingerprint
-from artifact_io import read_json, write_json
-from validation.model import torch
-from validation.recommendation_contracts import (
-    TRAINING_IMPLEMENTATION_VERSION,
-)
-from validation.representation_provenance import read_state
-from validation.shared_cache import SharedCache, checksum
-
-def bundle_files(identity):
-    from validation.leave_one_out_recommendation import result_files
-
-    return result_files(identity) + ["complete.json"]
+RESULT_FILES = ["sasrec.pt", "training.json", "per_event_metrics.jsonl", "catalog_vectors.npy",
+                "complete.json"]
+# Keys that only describe where a result lives, not how it was produced.
+LOCAL_KEYS = {"run_id", "arm"}
 
 
 def cache_for(context, identity):
-    key = fingerprint(
-        {
-            "identity": {k: v for k, v in identity.items() if k != "run_id"},
-            "implementation": TRAINING_IMPLEMENTATION_VERSION,
-            "architecture": identity["architecture_version"],
-        }
-    )
+    key = fingerprint({k: v for k, v in identity.items() if k not in LOCAL_KEYS})
     return SharedCache(context, "recommendations", key)
 
 
-def eligible(context, branch):
-    return read_state(context, branch).get("shareable", False)
-
-
-def valid_bundle(directory, identity, table, split):
-    from validation.leave_one_out_recommendation import combination_complete, phase_ids
-
-    ids = phase_ids(table, split, "test")
-    if not combination_complete(directory, identity, len(ids)):
-        return False
-    try:
-        training = read_json(directory / "training.json")
-        if training.get("split") != split or training.get("catalog_size") != len(table.items):
-            return False
-        expected = {int(i): table.rows[int(i)] for i in ids}
-        for line in (directory / "per_event_metrics.jsonl").read_text().splitlines():
-            row = json.loads(line)
-            source = expected.pop(row["event_id"])
-            if any(row.get(k) != v for k, v in source.items()):
-                return False
-        checkpoint = torch.load(directory / "sasrec.pt", map_location="cpu", weights_only=True)
-        metadata = checkpoint["metadata"]
-        return (
-            not expected
-            and bool(checkpoint["state_dict"])
-            and metadata.get("architecture_version")
-            == identity["architecture_version"]
-            and metadata.get("catalog_size") == len(table.items)
-            and metadata.get("best_epoch") == training.get("best_epoch")
-            and metadata.get("checkpoint_policy") == "best_validation_hr10"
-            and all(metadata.get(k) == v for k, v in identity.items())
-        )
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        RuntimeError,
-        EOFError,
-        pickle.UnpicklingError,
-        AttributeError,
-    ):
-        return False
-
-
-def restore(context, directory, identity, table, split):
-    from validation.leave_one_out_recommendation import ensure_compatible_output
-
-    ensure_compatible_output(directory, identity)
-    try:
-        return _restore(context, directory, identity, table, split)
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        RuntimeError,
-        EOFError,
-        pickle.UnpicklingError,
-        AttributeError,
-    ):
-        return False
-
-
-def _restore(context, directory, identity, table, split):
+def restore(context, directory, identity):
     cache = cache_for(context, identity)
-    directory.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=directory.parent) as temporary:
-        temporary = Path(temporary)
-        manifest = cache.restore(temporary)
-        if not manifest:
-            return False
-        old_identity = read_json(temporary / "complete.json").get("identity", {})
-        expected = {**identity, "run_id": old_identity.get("run_id")}
-        if not valid_bundle(temporary, expected, table, split):
-            return False
-        provenance = {"source_run_id": old_identity["run_id"], "cache_key": cache.key}
-        training = read_json(temporary / "training.json")
-        training.update(identity)
-        training["reused_from"] = provenance
-        write_json(temporary / "training.json", training)
-        complete = read_json(temporary / "complete.json")
-        complete.update(identity=identity, reused_from=provenance)
-        write_json(temporary / "complete.json", complete)
-        metrics = temporary / "per_event_metrics.jsonl"
-        rows = [json.loads(line) for line in metrics.read_text().splitlines()]
-        with metrics.open("w") as stream:
-            for row in rows:
-                row.update(identity)
-                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-        checkpoint = torch.load(temporary / "sasrec.pt", map_location="cpu", weights_only=True)
-        checkpoint["metadata"].update(identity)
-        checkpoint["metadata"]["reused_from"] = provenance
-        torch.save(checkpoint, temporary / "sasrec.pt")
-        complete["checksums"] = {
-            name: checksum(temporary / name) for name in bundle_files(identity)[:-1]
-        }
-        write_json(temporary / "complete.json", complete)
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "complete.json").unlink(missing_ok=True)
-        for name in bundle_files(identity):
-            shutil.copy2(temporary / name, directory / name)
+    if not cache.restore(directory):
+        return False
+    complete = read_json(directory / "complete.json")
+    complete["reused_from"] = {"source_run_id": complete.get("identity", {}).get("run_id"),
+                               "cache_key": cache.key}
+    complete["identity"] = identity
+    write_json(directory / "complete.json", complete)
     return True
 
 
-def publish(context, directory, identity, table, split, *, force=False):
-    if valid_bundle(directory, identity, table, split):
-        cache_for(context, identity).publish(
-            directory,
-            bundle_files(identity),
-            origin={"run_id": context.run_id},
-            replace_corrupt=not force,
-        )
+def publish(context, directory):
+    """Share a finished combination under the identity it was trained with."""
+    if (directory / "complete.json").is_file():
+        identity = read_json(directory / "complete.json")["identity"]
+        cache_for(context, identity).publish(directory, RESULT_FILES,
+                                             origin={"run_id": context.run_id})

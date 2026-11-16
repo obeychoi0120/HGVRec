@@ -42,21 +42,17 @@ def test_experiment_config_parsing_validation_and_snapshot(context, monkeypatch,
 
     # The snapshot survives file changes, and extraction does not require the file.
     _snapshot_survives_file_changes(context)
-    # Run comparison rejects the same label with a different definition (separate tree).
-    with monkeypatch.context() as patch:
-        _comparison_rejects_changed_definition(tmp_path, patch)
 
     # Invalid settings are rejected before outputs.
     context = make_context(tmp_path / "invalid")
     value = {"version": 1, "experiments": [{"label": "trial", "source": "graph_qwen3vl_2b"}]}
-    invalid = [None, {}, {**value, "version": True}, {**value, "experiments": []},
-               {**value, "defaults": {"source": "graph_qwen3vl_2b"}},
-               {**value, "defaults": {"readout": "attention"}},
-               {**value, "use_title": True}]
+    invalid = [None, {}, {**value, "experiments": []}]
+    # Unknown top-level and row keys are allowed (free-form notes, future settings).
+    parse_experiments({**value, "note": "x", "experiments": [{**value["experiments"][0], "note": "y"}]})
     for change in ({"source": None}, {"label": "../bad"}, {"label": ".hidden"}, {"label": ""},
-                   {"label": "has space"}, {"label": "a/b"}, {"readout": "sum"}, {"source": "missing"},
+                   {"label": "has space"}, {"label": "a/b"}, {"source": "missing"},
                    {"modules": "role_fusion"}, {"modules": [None]}, {"modules": ["unknown"]},
-                   {"modules": ["role_fusion", "role_fusion"]}, {"use_title": True},
+                   {"modules": ["role_fusion", "role_fusion"]},
                    {"source": "metadata", "modules": ["role_fusion"]},
                    {"source": "desc_qwen3vl_2b", "modules": ["activity_hypergraph"]}):
         invalid.append({**value, "experiments": [{**value["experiments"][0], **change}]})
@@ -170,7 +166,7 @@ def _complete_pipeline(context, monkeypatch, rows, baseline):
         assert not hasattr(model, "item_projection")
 
 
-def test_editing_experiment_list_reuses_results_and_preserves_conflicts(context, monkeypatch):
+def test_editing_experiment_list_reuses_results_and_force_retrains(context, monkeypatch):
     from artifact_io import read_json
     from helpers import train_inputs
     from validation.steps import embed_representations, prepare_module, run_recommendation
@@ -189,32 +185,10 @@ def test_editing_experiment_list_reuses_results_and_preserves_conflicts(context,
     replace_experiments(context, [rows[1]])
     assert run_recommendation(context)["skipped"] == 3
     assert all(p.read_bytes() == value for p, value in saved.items())
-    # Changed definitions cannot overwrite a label's previous architecture, including with force.
-    replace_experiments(context, [{**rows[1], "modules": []}])
-    with pytest.raises(ValueError, match="new Run ID"):
-        run_recommendation(context, force=True)
-    assert all(p.read_bytes() == value for p, value in saved.items())
     assert original["experiment_definition"]["modules"] == ["activity_hypergraph"]
-
-
-def _comparison_rejects_changed_definition(tmp_path, monkeypatch):
-    from dataclasses import replace
-    from artifact_io import write_json
-    from rec_experiments import experiment_definition
-    from validation.run_comparison import compare_runs
-
-    context = make_context(tmp_path / "comparison")
-
-    reference = replace(context, run_id="reference", run_root=context.run_root.parent / "reference")
-    definitions = {name: experiment_definition(arm) for name, arm in registry(context.config).items()}
-    for ctx in (context, reference):
-        for seed in ctx.config["validation"]["model"]["seeds"]:
-            for name, definition in definitions.items():
-                row = deepcopy(definition)
-                if ctx is reference and name == "graph-role-activity":
-                    row["modules"] = ["activity_hypergraph"]
-                write_json(ctx.recommendations_dir / f"seed_{seed}" / name / "training.json",
-                           {"experiment_definition": row})
-    monkeypatch.setattr("validation.run_comparison.RunContext.load", lambda *a, **kw: reference)
-    with pytest.raises(ValueError, match="identical experiment definitions: graph-role-activity"):
-        compare_runs(context, reference.run_id)
+    # A changed definition reuses finished files until --force retrains that label.
+    replace_experiments(context, [{**rows[1], "modules": []}])
+    assert run_recommendation(context)["skipped"] == 3
+    assert run_recommendation(context, force=True)["completed"] == 3
+    changed = read_json(context.recommendations_dir / "seed_42" / "graph-activity" / "identity.json")
+    assert changed["experiment_definition"]["modules"] == []

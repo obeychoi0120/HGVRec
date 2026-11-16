@@ -11,7 +11,7 @@ from typing import Any
 from extraction.backends.qwen_penalty import PENALTY_KEY
 from extraction.backends.qwen_repeat import REPEAT_STOP_KEY, drop_repeated_last_line
 from extraction.evidence import load_images
-from extraction.qwen_config import qwen_settings, validate_checkpoint, validate_checkpoint_family
+from extraction.qwen_config import qwen_settings
 
 
 @dataclass
@@ -43,15 +43,11 @@ class QwenBackend:
             from vllm.v1.engine.async_llm import AsyncLLM
         except ImportError as exc:
             raise RuntimeError(
-                "Qwen requires Linux/CUDA and the 'qwen' optional dependencies"
+                "Qwen requires Linux/CUDA and vLLM; pip install -r requirements-main.txt"
             ) from exc
         model_dir = Path(model_path)
         if not model_dir.is_dir():
             raise ValueError(f"Qwen local checkpoint directory is missing: {model_path}")
-        config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
-        if config.get("quantization_config"):
-            raise ValueError("Qwen vLLM pipeline requires a non-quantized BF16 checkpoint")
-        validate_checkpoint_family(config)
         resolved = qwen_settings(settings)
         processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
         generation_path = model_dir / "generation_config.json"
@@ -125,13 +121,6 @@ class QwenBackend:
         try:
             content = [{"type": "image", "image": image} for image in images]
             content.append({"type": "text", "text": task.prompt})
-            if task.model is not None:
-                import json
-                validate_checkpoint(
-                    task.model,
-                    json.loads((Path(self.model_id) / "config.json").read_text()),
-                    self.model_id,
-                )
             prompt = self.processor.apply_chat_template(
                 [{"role": "user", "content": content}],
                 tokenize=False,

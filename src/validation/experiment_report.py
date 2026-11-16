@@ -16,14 +16,12 @@ def write_report(context, selected, document):
     definitions = {row["label"]: display_definition(row) for row in document["experiments"]}
     lines = [
         f"# {context.run_id} / {context.dataset}: 추천 실험", "",
-        f"계약: `{document['arm_contract']}`. 모델 구조: `{report['architecture_version']}`.", "",
-        "| label | source | modules | readout | 모듈 버전 |",
-        "| --- | --- | --- | --- | --- |",
+        "| label | source | modules | readout |",
+        "| --- | --- | --- | --- |",
     ]
     for row in definitions.values():
-        versions = ", ".join(f"{k}={v}" for k, v in row["module_versions"].items()) or "—"
         lines.append(f"| {row['label']} | {row['source']} | {', '.join(row['modules']) or '—'} "
-                     f"| {row['readout']} | {versions} |")
+                     f"| {row['readout']} |")
     if context.dataset == "m3l_10m":
         from preparation.m3l import INTERPRETATION
 

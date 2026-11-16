@@ -143,15 +143,10 @@ def test_variant_arms_prepare_separate_sidecars_and_identities(context, monkeypa
     assert sorted(Counter(random_pairs[:, 1]).values()) == sorted(Counter(default_pairs[:, 1]).values())
 
     default = recommendation_identity(context, "graph-role-activity")
-    assert "segments" not in default["experiment_arm"]
     assert "segments" not in default["experiment_definition"]
-    seen = {str(default["scene_segments"])}
     for name in calls:
         identity = recommendation_identity(context, name)
-        assert identity["experiment_arm"]["segments"] == list(arms[name].segments)
         assert identity["experiment_definition"]["segments"] == dict(zip(("variant", "seed"), arms[name].segments))
-        seen.add(str(identity["scene_segments"]))
-    assert len(seen) == 1 + len(calls)
 
     # Every fixture video has two scenes in one segment, so no variant can move it; the statistics say so
     # before any training is spent on an uninformative comparison.
@@ -171,15 +166,6 @@ def test_variant_arms_prepare_separate_sidecars_and_identities(context, monkeypa
     assert np.array_equal(model.packed.store.scene_segments, random_pairs)
     with torch.no_grad():
         assert torch.isfinite(model.catalog_vectors()).all()
-
-    # A variant sidecar written for another seed is stale for this Arm.
-    _, meta_path = scene_segments_paths(directory, ("random", 0))
-    from artifact_io import read_json, write_json
-
-    meta = read_json(meta_path)
-    write_json(meta_path, {**meta, "seed": 9})
-    with pytest.raises(ValueError, match="prepare-module"):
-        load_scene_segments(directory, ("random", 0))
 
 
 def test_segment_variants_and_config():
