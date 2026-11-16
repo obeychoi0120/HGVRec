@@ -44,7 +44,9 @@ def test_report_uses_recorded_definitions_and_all_contrasts(context):
     assert "열위 근거 확보" in text and "50.00%" in text
     assert "| base |" in text
     assert "| description | desc_qwen3vl_2b | 5 | 50.00% | 2 | 1 | 100 | 100 |" in text
-    assert "activity_hypergraph=segments-v1" in text
-    assert "role_fusion=role-fusion/v1" in text
+    # Reports show config module names; the recorded definitions keep the internal ones.
+    assert "ASHA=segments-v1" in text and "REAF=role-fusion/v1" in text
+    assert "activity_hypergraph" not in text and "role_fusion" not in text
+    assert any("activity_hypergraph" in row["modules"] for row in document["experiments"])
     assert ARCHITECTURE_VERSION in text
     assert text.count("| -0.100000 |") == 10

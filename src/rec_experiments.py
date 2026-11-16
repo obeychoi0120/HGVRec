@@ -21,6 +21,19 @@ MODULE_ALIASES = {
 }
 
 
+MODULE_DISPLAY_NAMES = {internal: name for name, internal in MODULE_ALIASES.items()}
+
+
+def display_definition(definition):
+    """Copy of a recorded definition with config module names, for logs and reports only.
+
+    Identities keep the internal names, so recorded results stay valid.
+    """
+    rename = lambda name: MODULE_DISPLAY_NAMES.get(name, name)
+    return {**definition, "modules": [rename(m) for m in definition["modules"]],
+            "module_versions": {rename(m): v for m, v in definition["module_versions"].items()}}
+
+
 def parse_experiments(value):
     from arm_registry import generation_registry
 

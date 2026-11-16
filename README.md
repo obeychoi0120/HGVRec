@@ -50,7 +50,7 @@ experiments:
 | `defaults.readout` | 선택 항목. 생략하면 `mean`. 공통 `source`는 허용하지 않습니다. |
 | `experiments[].label` | 필수 사용자 지정 이름. 소문자 영문으로 시작하고 영문 소문자·숫자·하이픈만 사용하며 중복은 허용하지 않습니다. 모델 구조를 결정하지 않습니다. |
 | `experiments[].source` | 각 실험에 필수. `metadata`, `graph_qwen3vl_2b`, `desc_qwen3vl_2b`, `graph_qwen3vl_8b`, `desc_qwen3vl_8b`, `graph_gemini`, `desc_gemini` 중 선택합니다. |
-| `experiments[].modules` | 생략하면 `[]`. Graph source에서 `REAF`(role_fusion), `GNN_ATTN`(scene_attention), `ASHA`(activity_hypergraph)를 단독 또는 함께 사용할 수 있습니다. 결과 identity에는 괄호 안의 내부 이름이 기록되며, 내부 이름도 설정에서 계속 읽습니다. |
+| `experiments[].modules` | 생략하면 `[]`. Graph source에서 `REAF`(role_fusion), `GNN_ATTN`(scene_attention), `ASHA`(activity_hypergraph)를 단독 또는 함께 사용할 수 있습니다. 결과 identity에는 괄호 안의 내부 이름이 기록되며, 내부 이름도 설정에서 계속 읽습니다. 단계 로그와 보고서에는 설정 이름(`REAF`, `GNN_ATTN`, `ASHA`)으로 표시합니다. |
 | `experiments[].readout` | 개별 값 → 공통값 → `mean` 순서로 적용합니다. 현재 `mean`만 지원합니다. |
 | `experiments[].segments` | 선택 항목. `ASHA`가 있는 실험에서만 허용합니다. 생략하면 기본 활동 구간을 사용하고 기존 결과 identity가 바뀌지 않습니다. `action_bag`, `time_window`, `random` 중 하나를 지정하면 모델 구조는 같고 장면–구간 소속만 바꾼 ablation이 됩니다. 아래 표를 참고하세요. |
 | `experiments[].segments_seed` | 선택 항목. 생략하면 `0`. `segments` 변형을 만드는 난수 seed이며 0 이상의 정수입니다. 모델 학습 seed와는 별개입니다. |

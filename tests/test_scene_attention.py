@@ -281,3 +281,15 @@ def test_closed_segment_gates_reduce_to_the_exchange_model(role_fusion):
         assert not torch.allclose(model.catalog_vectors(), reference.catalog_vectors())
     report = model.execution_report()
     assert set(report["scene_attention_norms"]) == {"query", "key", "projection"}
+
+
+def test_logs_show_config_module_names_while_identity_keeps_internal_ones():
+    from rec_experiments import display_definition, experiment_definition
+
+    resolved = parse_experiments({"version": 1, "experiments": [
+        {"label": "all", "source": "graph_qwen3vl_2b", "modules": ["ASHA", "GNN_ATTN", "REAF"]}]})
+    definition = experiment_definition(registry({CONFIG_KEY: resolved})["all"])
+    shown = display_definition(definition)
+    assert shown["modules"] == ["REAF", "GNN_ATTN", "ASHA"]
+    assert shown["module_versions"] == {"REAF": "role-fusion/v1", "GNN_ATTN": "gnn-attn/v1", "ASHA": "segments-v1"}
+    assert definition["modules"] == ["role_fusion", "scene_attention", "activity_hypergraph"]

@@ -11,7 +11,9 @@ def write_report(context, selected, document):
     statistics = document["statistics"]
     relative = report["base_relative_changes"]
     baseline = report["baseline"]
-    definitions = {row["label"]: row for row in document["experiments"]}
+    from rec_experiments import display_definition
+
+    definitions = {row["label"]: display_definition(row) for row in document["experiments"]}
     lines = [
         f"# {context.run_id} / {context.dataset}: 추천 실험", "",
         f"계약: `{document['arm_contract']}`. 모델 구조: `{report['architecture_version']}`.", "",
