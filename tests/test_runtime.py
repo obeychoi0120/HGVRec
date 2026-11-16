@@ -6,7 +6,10 @@ from arm_registry import generation_registry, registry, select_arms
 from validation.steps import validation_config
 
 
-def test_current_config_loads(context):
+def test_config_loading_and_validation(context):
+    from copy import deepcopy
+    from pipeline_runtime import ConfigError, RunContext, _validate_config, require_generation_config
+
     settings = validation_config(context)
     assert settings.encoder.embedding_dim == 1024
     assert settings.model.embedding_dim == 512
@@ -14,87 +17,118 @@ def test_current_config_loads(context):
     assert settings.model.max_sequence_length == 10
     assert context.run_root == context.root / "artifacts" / "runs" / "regression" / "microlens_100k"
     paths = [context.path("data", key) for key in context.data]
-    paths += [context.path("models", key) for key in ("qwen3vl", "qwen3.5", "bge")]
+    paths += [context.path("models", key) for key in ("qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "bge")]
     assert all(path.is_relative_to(context.root) for path in paths)
     assert not any(str(path).startswith("/home_nvme") for path in paths)
-    assert Path(settings.dataset.pairs_csv).is_file()
+    assert Path(settings.dataset["pairs_csv"]).is_file()
+
+    # Per-Run analyses live in artifacts/runs/<RUN_ID>/reports/ (AGENTS.md).
+    (context.run_root.parent / "reports").mkdir(parents=True)
+    loaded = RunContext.load(context.run_id, dataset=context.dataset, root=context.root)
+    assert loaded.run_root == context.run_root
+
+    # Unused models may be omitted until a step needs them.
+    config = deepcopy(context.config)
+    config.pop("_rec_experiments")
+    for section in (config["models"], config["extraction"]["graph"], config["extraction"]["description"]):
+        for name in ("qwen3vl_4b", "qwen3vl_8b", "gemini"):
+            section.pop(name)
+    config["extraction"].pop("gemini")
+    _validate_config(config)
+    require_generation_config(config, "graph", "qwen3vl_2b")
+    for model in ("qwen3vl_4b", "qwen3vl_8b", "gemini"):
+        with pytest.raises(ConfigError, match=f"models.{model}"):
+            require_generation_config(config, "graph", model)
+    # Unknown keys are allowed so experiments can add settings without editing a validator.
+    config["models"]["unknown_model"] = "x"
+    config["extra_section"] = {"anything": 1}
+    _validate_config(config)
+    # Validation settings fall back to defaults and accept sweep values.
+    config["validation"]["model"] = {"num_blocks": 3, "seeds": [1]}
+    from validation.config import build_validation_config
+
+    swept = build_validation_config(run_id="x", dataset={}, settings=config["validation"],
+                                    model_path=".", output_dir=".")
+    assert (swept.model.num_blocks, swept.model.seeds, swept.model.max_sequence_length) == (3, [1], 10)
+    with pytest.raises(ConfigError):
+        _validate_config({k: v for k, v in config.items() if k != "datasets"})
 
 
-def test_empty_run_directories_can_be_initialized(context):
-    from pipeline_runtime import RunContext
-
-    directory = context.artifact_root / "runs" / "empty-run" / context.dataset
-    (directory / "extraction" / "scenes").mkdir(parents=True)
-    (directory / "validation").mkdir()
-    fresh = RunContext.load("empty-run", dataset=context.dataset, root=context.root)
-    fresh.initialize()
-    assert not (directory / "run_contract.json").exists()
-
-
-def test_existing_results_without_contract_are_preserved(context):
-    from pipeline_runtime import RunContext
-
-    directory = context.artifact_root / "runs" / "261027_v14" / context.dataset
-    (directory / "extraction").mkdir(parents=True)
-    result = directory / "extraction" / "result.json"
-    result.write_text('{"historical": true}')
-    selected = RunContext.load("261027_v14", dataset=context.dataset, root=context.root)
-    selected.initialize()
-    assert result.read_text() == '{"historical": true}'
-    assert not (directory / "run_contract.json").exists()
-
-
-def test_legacy_run_contract_is_ignored_and_preserved(context):
-    from pipeline_runtime import RunContext
-
-    context.run_root.mkdir(parents=True)
-    path = context.run_root / "run_contract.json"
-    path.write_text("historical metadata; not read by the pipeline")
-    selected = RunContext.load(context.run_id, dataset=context.dataset, root=context.root)
-    selected.initialize()
-    assert path.read_text() == "historical metadata; not read by the pipeline"
-
-
-def test_arm_sources_and_title_policy(context):
-    from arm_registry import RECOMMENDATION_ARM_CONTRACT, feature_source, target_set
+def test_arm_sources_title_policy_and_cli(context, monkeypatch):
+    from arm_registry import feature_source, target_set
 
     arms = registry(context.config)
     assert list(arms) == [
-        "base", "d0", "d1", "g0", "g1", "g2", "g3", "g4", "g1a", "g1b", "g1c", "g3a", "g5", "g5a",
+        "base", "description", "graph", "graph-activity", "graph-role-activity",
     ]
     assert all(arm.uses_title for arm in arms.values())
     assert [feature_source(arm) for arm in arms.values()] == [
-        "metadata", "desc_qwen3vl", "desc_qwen3vl", *(["graph_qwen3vl"] * 11),
+        "metadata", "desc_qwen3vl_2b", *(["graph_qwen3vl_2b"] * 3),
     ]
-    sources = generation_registry(context.config)
+    sources = generation_registry()
+    for name, arm in sources.items():
+        expected = context.run_root / "extraction" / name
+        assert context.scene_arm_dir(name) == expected
+        assert context.extraction_dir(arm.representation, arm.model, "scenes") == expected
     assert all(not arm.uses_title and arm.name == arm.scene_arm for arm in sources.values())
-    assert "graph_minicpm" in sources and "graph_gemini" in sources
-    assert list(select_arms(context.config, ["g1", "base"])) == ["base", "g1"]
-    assert target_set(context.config, ["g1", "base"]) == "base_g1"
-    assert RECOMMENDATION_ARM_CONTRACT == "gnn-attn-aggregation/v1"
+    assert set(sources) == {
+        "graph_qwen3vl_2b", "desc_qwen3vl_2b", "graph_qwen3vl_4b", "desc_qwen3vl_4b",
+        "graph_qwen3vl_8b", "desc_qwen3vl_8b", "graph_gemini", "desc_gemini",
+    }
+    assert list(select_arms(context.config, ["graph-activity", "base"])) == ["base", "graph-activity"]
+    assert target_set(context.config, ["graph-activity", "base"]) == "base_graph-activity"
+    assert all(arms[name].aggregation == "mean" for name in ("description", "graph", "graph-activity", "graph-role-activity"))
+    assert [arms[name].role_fusion for name in ("graph", "graph-activity", "graph-role-activity")] == [False, False, True]
+    assert [arms[name].extensions for name in ("graph", "graph-activity", "graph-role-activity")] == [(), ("segments",), ("segments",)]
     assert context.representations_dir == context.validation_dir / "representations"
     assert context.recommendations_dir == context.validation_dir / "recommendations"
-    assert context.diagnosis_path(["g1", "base"]) == (
-        context.validation_dir / "diagnosis" / "base_g1" / "diagnosis.json"
+    assert context.diagnosis_path(["graph-activity", "base"]) == (
+        context.validation_dir / "diagnosis" / "base_graph-activity" / "diagnosis.json"
     )
-    for targets in ([], ["base", "base"], ["meta"], ["graph_minicpm"], ["missing"],
-                    ["a1"], ["a2"], ["a3"], ["g3s"]):
+    for targets in ([], ["base", "base"], ["missing"]):
         with pytest.raises(ValueError):
             select_arms(context.config, targets)
 
-
-def test_cli_mixed_arms_and_removed_options(context, monkeypatch):
+    # The CLI requires a dataset and rejects removed options.
     from pipeline_runtime import RunContext
     from validation.cli import STEP_HANDLERS, main
 
     monkeypatch.setattr(RunContext, "load", lambda run_id, *, dataset: context)
     calls = []
     monkeypatch.setitem(STEP_HANDLERS, "run-recommendation", lambda ctx, **kw: calls.append(kw))
-    command = ["run-recommendation", "--run-id", context.run_id, "--dataset", context.dataset, "--target", "d1", "g1c"]
+    command = ["run-recommendation", "--run-id", context.run_id, "--dataset", context.dataset]
     assert main(command) == 0
-    assert calls == [{"force": False, "target": ["d1", "g1c"]}]
+    assert calls == [{"force": False}]
+    with pytest.raises(SystemExit) as exc:
+        main(["run-recommendation", "--run-id", context.run_id])
+    assert exc.value.code == 2
     for option in (["--representation-mode", "graph"], ["--scene-aggregation", "mean"],
-                   ["--step", "ablation"]):
+                   ["--step", "ablation"], ["--profile-every", "100"],
+                   ["--profile-operators"], ["--target", "graph"],
+                   ["--experiments", "another.yaml"]):
         with pytest.raises(SystemExit):
             main(command + option)
-    assert main(["run-recommendation", "--run-id", context.run_id, "--dataset", context.dataset, "--target", "graph_minicpm"]) == 1
+
+
+def test_recommendation_logs_effective_deterministic(context, monkeypatch, capsys):
+    from validation import leave_one_out_recommendation
+    from validation.steps import run_recommendation
+
+    settings = context.config["validation"]["model"]
+    calls = []
+    monkeypatch.setattr(
+        leave_one_out_recommendation, "run_leave_one_out",
+        lambda ctx, **kwargs: calls.append(kwargs),
+    )
+    for configured, expected in ((False, "false"), (True, "true"), (None, "true")):
+        if configured is None:
+            settings.pop("deterministic", None)
+        else:
+            settings["deterministic"] = configured
+        calls.clear()
+        run_recommendation(context, target=["base"], workers_per_gpu=4)
+        output = capsys.readouterr().out
+        assert f"  deterministic: {expected}\n" in output, configured
+        assert "profile_every" not in output
+        assert "profile_operators" not in output
+        assert calls == [{"force": False, "target": ["base"], "workers_per_gpu": 4}]

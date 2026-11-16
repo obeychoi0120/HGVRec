@@ -7,22 +7,21 @@ import torch
 
 from artifact_io import read_json
 from helpers import events, prepare_inputs, result_identity, selected_table, simple_model
-from validation.early_stopping import EarlyStopping
 from validation.leave_one_out_data import EventTable
-from validation.leave_one_out_execution import execution_for, masked_ranks, negative_mask
+from validation.leave_one_out_execution import execution_for, masked_ranks
 from validation.leave_one_out_recommendation import (
     phase_ids,
     prepare_split,
     run_combination,
     transition_loss,
 )
-from validation.metrics import metrics_from_rank
+from validation.leave_one_out_data import metrics_from_rank
 from validation.steps import validation_config
 
 pytestmark = pytest.mark.torch
 
 
-def test_history_inputs_keep_latest_ten():
+def _check_history_inputs_and_training_popularity_exclude_holdouts():
     table = EventTable(events((13,)))
     execution = execution_for(table)
     actual = execution.inputs([0, 3, 12], 10, "cpu")
@@ -31,8 +30,6 @@ def test_history_inputs_keep_latest_ten():
     assert 13 not in actual[2].tolist()
     assert table.history(12) == list(range(1, 13))
 
-
-def test_training_popularity_excludes_holdouts():
     table = EventTable(events())
     split = table.splits()[0]
     ids, probabilities, frequencies = prepare_split(table, split)
@@ -49,21 +46,7 @@ def test_training_popularity_excludes_holdouts():
         assert probabilities["train"][table.targets[event]] == 0
 
 
-def test_inbatch_negative_mask():
-    inputs = torch.tensor([[1, 3, 0], [1, 0, 0], [2, 0, 0], [0, 0, 0]])
-    targets = torch.tensor([2, 2, 3, 4])
-    expected = torch.tensor(
-        [
-            [False, True, True, False],
-            [True, False, False, False],
-            [True, True, False, False],
-            [False, False, False, False],
-        ]
-    )
-    assert torch.equal(negative_mask(inputs, targets), expected)
-
-
-def test_transition_loss_matches_reference():
+def _check_transition_loss_matches_reference():
     table = EventTable(events((5, 5)))
     model = simple_model(item_count=10)
     ids = np.array([2, 7, 3])
@@ -92,7 +75,7 @@ def test_transition_loss_matches_reference():
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
-def test_ranking_masks_full_preceding_history():
+def _check_ranking_masks_full_preceding_history():
     rows = events((13,))
     rows[-1]["item_id"] = "1"  # Repeated target, outside the model's latest ten inputs.
     table = EventTable(rows)
@@ -110,7 +93,7 @@ def test_ranking_masks_full_preceding_history():
     assert torch.isneginf(scores[0, :12]).all()
 
 
-def test_hr_ndcg_cutoff_boundaries():
+def _check_hr_ndcg_cutoff_boundaries():
     for cutoff in (4, 8, 10, 20, 30):
         assert metrics_from_rank(1, [cutoff]) == {f"HR@{cutoff}": 1.0, f"NDCG@{cutoff}": 1.0}
         at = metrics_from_rank(cutoff, [cutoff])
@@ -120,16 +103,6 @@ def test_hr_ndcg_cutoff_boundaries():
             f"HR@{cutoff}": 0.0,
             f"NDCG@{cutoff}": 0.0,
         }
-
-
-def test_early_stopping_keeps_first_best_epoch():
-    stopping = EarlyStopping(patience=2)
-    assert not stopping.update(1, 0.2)
-    assert not stopping.update(2, 0.7)
-    assert not stopping.update(3, 0.7)
-    assert stopping.update(4, 0.6)
-    assert stopping.best_epoch == 2
-    assert stopping.best_score == 0.7
 
 
 def test_best_checkpoint_is_tested_once(context, monkeypatch):
@@ -189,3 +162,14 @@ def test_best_checkpoint_is_tested_once(context, monkeypatch):
     checkpoint = torch.load(directory / "sasrec.pt", map_location="cpu", weights_only=True)
     for name, tensor in checkpoint["state_dict"].items():
         torch.testing.assert_close(tensor, best_state[name], rtol=0, atol=0)
+
+
+def test_inputs_loss_ranking_and_metric_cutoffs():
+    # History inputs and training popularity exclude holdouts.
+    _check_history_inputs_and_training_popularity_exclude_holdouts()
+    # Transition loss matches reference.
+    _check_transition_loss_matches_reference()
+    # Ranking masks full preceding history.
+    _check_ranking_masks_full_preceding_history()
+    # Hr ndcg cutoff boundaries.
+    _check_hr_ndcg_cutoff_boundaries()

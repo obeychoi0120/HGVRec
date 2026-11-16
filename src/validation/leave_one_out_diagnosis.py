@@ -3,17 +3,11 @@
 from __future__ import annotations
 import numpy as np
 from artifact_io import read_json
-from validation.metrics import metrics_from_rank
-from validation.recommendation_contracts import (
-    DIAGNOSIS_ARCHITECTURE_VERSIONS,
-    EVALUATION_CONTRACT,
-    resolve_target_arms,
-)
-from arm_registry import registry
-from validation.representation_checks import verify_representations
+from validation.leave_one_out_data import metrics_from_rank
+from arm_registry import registry, resolve_target_arms
 from validation.leave_one_out_data import EventTable, PROTOCOL
 from preparation.cohort import iter_jsonl
-from validation.selection import load_validation_cohort, training_signature
+from validation.selection import load_validation_cohort
 from validation.leave_one_out_recommendation import combination_complete, combination_dir, phase_ids
 
 MEMORY_LIMIT = 128 * 1024**2
@@ -59,9 +53,7 @@ def cluster_bootstrap(sums, counts, *, samples, seed=42, memory_limit=MEMORY_LIM
 
 def comparisons(observed, draws, settings, *, arms=None, config=None):
     from validation.diagnosis_statistics import comparison_families
-    from validation.recommendation_contracts import DEFAULT_PROTOCOL
-
-    configured = registry(config or DEFAULT_PROTOCOL)
+    configured = registry(config)
     names = list(configured if arms is None else arms)
     indices = {name: index for index, name in enumerate(names)}
     if len(observed) != len(names) or draws.shape[1] != len(names):
@@ -77,7 +69,8 @@ def comparisons(observed, draws, settings, *, arms=None, config=None):
             a, b = (indices[left], indices[right])
             delta = draws[:, a] - draws[:, b]
             lo, hi = np.quantile(delta, [alpha / 2, 1 - alpha / 2])
-            result[f"{left}-{right}"] = {
+            result[f"{left}|{right}"] = {
+                "left": left, "right": right,
                 "family": family,
                 "role": "confirmatory",
                 "family_size": len(pairs),
@@ -94,120 +87,45 @@ def comparisons(observed, draws, settings, *, arms=None, config=None):
     return result
 
 
-def diagnosis_training(directory, identity, expected_count, *, architecture_version=None):
-    """Validate completed results for the selected text or graph architecture."""
-    training = read_json(directory / "training.json")
-    recorded = training.get("architecture_version")
-    if recorded not in DIAGNOSIS_ARCHITECTURE_VERSIONS:
-        raise ValueError(f"unsupported diagnosis architecture {recorded!r}: {directory}")
-    if architecture_version is not None and recorded != architecture_version:
-        raise ValueError(
-            f"mixed recommendation architectures: expected {architecture_version}, found {recorded}: {directory}"
-        )
-    if training.get("evaluation_contract") != EVALUATION_CONTRACT:
-        raise ValueError(f"unsupported evaluation contract; rerun run-recommendation: {directory}")
-    if not combination_complete(directory, identity, expected_count, architecture_version=recorded):
-        raise ValueError(f"incomplete/corrupt combination: {directory}")
-    return training
-
-
 def collect_metrics(context, config, cohort, *, arms=None):
-    selected = registry(context.config) if arms is None else arms
-    cohort = load_validation_cohort(context)
+    from rec_experiments import experiment_definition
+
+    registered = registry(context.config)
+    selected = ({name: name for name in registered} if arms is None else arms)
     table = EventTable(cohort["events"])
-    training_input_hash = training_signature(context, cohort, config)
     users = {user: i for i, user in enumerate(table.users)}
-    splits = cohort["plan"]["splits"]
-    if (len(table.users), len(table.rows), len(table.items)) != (
-        cohort["plan"]["user_count"],
-        cohort["plan"]["interaction_count"],
-        cohort["plan"]["item_count"],
-    ) or splits != table.splits():
-        raise ValueError("validation cohort cardinality or leave-one-out split manifest mismatch")
     arms = list(selected)
-    verify_representations(context, cohort, arms=selected)
     sums = np.zeros((len(users), len(arms)))
     counts = np.zeros(len(users))
     metrics = list(metrics_from_rank(1, config.evaluation.cutoffs))
     per_seed = []
     total = 0
-    architecture_version = None
     model_reports = {}
-    for split in splits:
+    for split in cohort["plan"]["splits"]:
         ids = phase_ids(table, split, "test")
-        expected = set(ids.tolist())
         for event in ids:
             counts[users[table.rows[event]["user_id"]]] += 1
-        raw_train = np.asarray(split["phases"]["train"]["event_ids"], dtype=np.int64)
-        frequencies = np.bincount(table.targets[raw_train], minlength=len(table.items) + 1)
         for seed in config.model.seeds:
             for index, arm in enumerate(arms):
-                identity = {
-                    "run_id": context.run_id,
-                    "protocol": PROTOCOL,
-                    "evaluation_contract": dict(EVALUATION_CONTRACT),
-                    "split_hash": split["split_hash"],
-                    "seed": seed,
-                    "arm": arm,
-                    "training_input_hash": training_input_hash,
-                    "deterministic": config.model.deterministic,
-                }
-                from validation.representation_provenance import recommendation_identity
-
-                identity.update(recommendation_identity(context, selected[arm]))
                 directory = combination_dir(context, seed, arm)
-                training = diagnosis_training(
-                    directory, identity, len(ids), architecture_version=architecture_version
-                )
-                architecture_version = training["architecture_version"]
+                if not combination_complete(directory):
+                    raise ValueError(f"missing recommendation result: {directory}; run run-recommendation")
+                training = read_json(directory / "training.json")
                 model_reports[arm] = {
                     "parameters": training.get("parameters", {}),
-                    "role_corruption": training.get("role_corruption_report"),
+                    "experiment_definition": experiment_definition(registered[selected[arm]]),
                 }
-                best = training["best_epoch"]
-                if training["split"] != split or best not in [row["epoch"] for row in training["train"]]:
-                    raise ValueError("training split/checkpoint epoch mismatch")
-                count = split["phases"]["train"]["eligible_count"]
-                for row in training["train"]:
-                    if (
-                        row["positive_count"] != count
-                        or row["optimizer_updates"]
-                        != (count + config.model.batch_size - 1) // config.model.batch_size
-                    ):
-                        raise ValueError("training transition/update count mismatch")
-                seen = set()
                 totals = dict.fromkeys(metrics, 0.0)
+                seen = 0
                 for row in iter_jsonl(directory / "per_event_metrics.jsonl"):
-                    event = row["event_id"]
-                    if type(event) is not int or event not in expected or event in seen:
-                        raise ValueError("duplicate or unexpected test event")
-                    seen.add(event)
-                    source = table.rows[event]
-                    if any((row.get(k) != v for k, v in {**source, **identity}.items())):
-                        raise ValueError("event identity mismatch")
-                    rank = row["rank"]
-                    if type(rank) is not int or not 1 <= rank <= len(table.items):
-                        raise ValueError("invalid event rank")
-                    if row["candidate_count"] != len(table.items):
-                        raise ValueError("candidate catalog mismatch")
-                    if row["train_item_frequency"] != int(frequencies[table.targets[event]]):
-                        raise ValueError("train target frequency mismatch")
-                    calculated = metrics_from_rank(rank, config.evaluation.cutoffs)
-                    if any(
-                        (
-                            not np.isfinite(row[m]) or abs(row[m] - calculated[m]) > 1e-12
-                            for m in metrics
-                        )
-                    ):
-                        raise ValueError("event metric/rank mismatch")
                     for metric in metrics:
                         totals[metric] += row[metric]
-                    sums[users[source["user_id"]], index] += row["NDCG@10"] / len(
-                        config.model.seeds
-                    )
-                    total += 1
-                if seen != expected:
-                    raise ValueError("missing eligible test events")
+                    sums[users[row["user_id"]], index] += row["NDCG@10"] / len(config.model.seeds)
+                    seen += 1
+                # Bootstrap needs one test event per user; a short file would silently bias it.
+                if seen != len(ids):
+                    raise ValueError(f"expected {len(ids)} test events, found {seen}: {directory}")
+                total += seen
                 per_seed.append(
                     {
                         "protocol": PROTOCOL,
@@ -218,9 +136,6 @@ def collect_metrics(context, config, cohort, *, arms=None):
                         **{k: v / len(ids) for k, v in totals.items()},
                     }
                 )
-    expected_total = cohort["plan"]["eligible_test_count"] * len(arms) * len(config.model.seeds)
-    if total != expected_total:
-        raise ValueError("event grid cardinality mismatch")
     means = {
         arm: {m: float(np.mean([r[m] for r in per_seed if r["arm"] == arm])) for m in metrics}
         for arm in arms
@@ -230,33 +145,33 @@ def collect_metrics(context, config, cohort, *, arms=None):
               if len(config.model.seeds) > 1 else 0.0 for metric in metrics}
         for arm in arms
     }
+    baseline = next((name for name, arm in registered.items()
+                     if name in arms and arm.representation == "metadata"), None)
     relative = {
-        arm: {metric: (means[arm][metric] / means["base"][metric] - 1)
-              if means["base"][metric] > 0 else None for metric in metrics}
+        arm: {metric: (means[arm][metric] / means[baseline][metric] - 1)
+              if means[baseline][metric] > 0 else None for metric in metrics}
         for arm in arms
-    } if "base" in arms else None
+    } if baseline is not None else None
     return (
         sums,
         counts,
         {
-            "evaluation_contract": dict(EVALUATION_CONTRACT),
-            "architecture_version": architecture_version,
-            "expected_event_count": expected_total,
             "actual_event_count": total,
             "combination_count": len(per_seed),
             "per_seed": per_seed,
             "means": means,
             "standard_deviations": standard_deviations,
             "base_relative_changes": relative,
+            "baseline": baseline,
             "model_reports": model_reports,
         },
     )
 
 
 def diagnose(context, *, target=None, compare_run_id=None):
-    from arm_registry import RECOMMENDATION_ARM_CONTRACT, target_set
+    from arm_registry import target_set
     from artifact_io import atomic_write_json
-    from validation.steps import validation_config
+    from validation.config import validation_config
     from validation.diagnosis_statistics import comparison_contract
     from validation.representation_provenance import read_state
 
@@ -266,11 +181,12 @@ def diagnose(context, *, target=None, compare_run_id=None):
     contract = comparison_contract(context.config, arms)
     selected = target_set(context.config, arms)
     destination = context.diagnosis_path(arms)
+    from rec_experiments import experiment_definition
+
     document = {
+        "experiments": [experiment_definition(registry(context.config)[name]) for name in arms],
         "dataset": context.dataset,
-        "schema_version": "leave-one-out-diagnosis/v5",
-        "arm_contract": RECOMMENDATION_ARM_CONTRACT,
-        "evaluation_contract": dict(EVALUATION_CONTRACT),
+        "schema_version": "leave-one-out-diagnosis/v7",
         "run_id": context.run_id,
         "targets": list(arms),
         "statistics": {"status": "not_computed", **contract},
@@ -312,12 +228,14 @@ def diagnose(context, *, target=None, compare_run_id=None):
     write_report(context, selected, document)
     cutoff = config.evaluation.primary_cutoff
     metrics = (f"NDCG@{cutoff}", f"HR@{cutoff}")
-    print("\n[Diagnosis] Arm별 최종 test 지표 (seed 평균)", flush=True)
-    print(f"{'Arm':<6} {metrics[0]:>12} {metrics[1]:>12}", flush=True)
+    print("\n[Diagnosis] Arm별 최종 test 지표 (seed 평균 ± 표준편차)", flush=True)
+    print(f"{'Arm':<6} {metrics[0]:>23} {metrics[1]:>23}", flush=True)
     for arm in arms:
         values = document["recommendations"]["means"][arm]
+        deviations = document["recommendations"]["standard_deviations"][arm]
+        columns = [f"{values[m]:.6f} ± {deviations[m]:.6f}" for m in metrics]
         print(
-            f"{display_arm(arm):<6} {values[metrics[0]]:>12.6f} {values[metrics[1]]:>12.6f}",
+            f"{display_arm(arm):<6} {columns[0]:>23} {columns[1]:>23}",
             flush=True,
         )
     return {"stage": "run-diagnosis", "status": "pass", "path": str(destination)}

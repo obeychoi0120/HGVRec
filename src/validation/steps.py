@@ -3,67 +3,66 @@
 import json
 
 from pipeline_logging import log_step_start
-from validation.config import build_validation_config
-from validation.recommendation_contracts import resolve_target_arms
+from rec_experiments import load_experiments
+from validation.config import validation_config
+from arm_registry import resolve_target_arms
 
-
-def validation_config(context):
-    return build_validation_config(
-        run_id=context.run_id,
-        dataset={key: context.path("data", key) for key in context.data},
-        settings=context.config["validation"],
-        model_path=context.path("models", "bge"),
-        output_dir=context.run_root,
-    )
-
+__all__ = ["validation_config"]
 
 
 def embed_representations(context, *, force=False, target=None):
     from validation.graph_inputs import prepare
 
+    load_experiments(context)
     resolve_target_arms(target, config=context.config)
     log_step_start(context, "embed-representations", force=force, target=target)
     return prepare(context, target=target, force=force)
 
 
 def prepare_module(context, *, force=False, target=None):
-    from arm_registry import registry
+    from arm_registry import feature_source, registry
     from validation.scene_segments import attach
+    from validation.segment_variants import attach_variant
 
+    load_experiments(context)
     selected = resolve_target_arms(target, config=context.config)
     arms = registry(context.config)
-    invalid = [name for name in selected if "segments" not in arms[name].extensions]
-    if invalid:
-        raise ValueError("prepare-module requires Arms with the segments extension: " + ", ".join(invalid))
     log_step_start(context, "prepare-module", force=force, target=target)
     statistics = {}
+    prepared = {}
     for name in selected:
-        statistics[name] = attach(context, name)
+        if "segments" not in arms[name].extensions:
+            continue
+        # Arms over one source share a sidecar per segment variant (None is the default segments).
+        key = (feature_source(arms[name]), arms[name].segments)
+        if key not in prepared:
+            prepared[key] = (attach if key[1] is None else attach_variant)(context, name)
+        statistics[name] = {**prepared[key], "arm": name}
         print(json.dumps(statistics[name], indent=1))
     return {"stage": "prepare-module", "selected_arms": list(selected), "statistics": statistics}
 
 
 def run_recommendation(
     context, *, force=False, workers_per_gpu=1, target=None,
-    profile_every=None, profile_operators=False,
 ):
     from validation.leave_one_out_recommendation import run_leave_one_out
 
+    load_experiments(context)
     resolve_target_arms(target, config=context.config)
     log_step_start(context, "run-recommendation", force=force, target=target,
-                   workers_per_gpu=workers_per_gpu, profile_every=profile_every,
-                   profile_operators=profile_operators)
+                   workers_per_gpu=workers_per_gpu,
+                   deterministic=validation_config(context).model.deterministic)
     context.initialize()
     return run_leave_one_out(
         context, force=force, workers_per_gpu=workers_per_gpu, target=target,
-        profile_every=profile_every, profile_operators=profile_operators,
     )
 
 
 def run_diagnosis(context, *, force=False, target=None, compare_run_id=None):
     from validation.leave_one_out_diagnosis import diagnose
 
-    resolve_target_arms(target, config=context.config)
+    load_experiments(context)
+    target = resolve_target_arms(target, config=context.config)
     log_step_start(context, "run-diagnosis", force=force, target=target,
                    compare_run_id=compare_run_id)
     return diagnose(context, target=target, compare_run_id=compare_run_id)

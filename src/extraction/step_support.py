@@ -7,13 +7,20 @@ from typing import Any
 from tqdm import tqdm
 
 from extraction.backends.qwen_workers import QwenGenerationTask
-from extraction.errors import ExtractionStepError
 from extraction.evidence import build_scene_evidence
-from extraction.monitoring import video_names
 from extraction.progress import InferenceProgress
-from extraction.scene_storage import write_scene_records
+from extraction.scene_storage import ExtractionStepError, write_scene_records
 from pipeline_runtime import RunContext
 from artifact_io import read_jsonl
+
+
+def video_names(catalog: list[dict[str, Any]]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for row in catalog:
+        content_id = str(row["content_id"])
+        source = str(row.get("source_video_path") or "").strip()
+        names[content_id] = Path(source.replace("\\", "/")).name if source else f"{content_id}.mp4"
+    return names
 
 
 def write_progress(progress: tqdm | InferenceProgress, message: str) -> None:
@@ -89,76 +96,6 @@ def result(
         "content_count": content_count,
         "failure_count": failure_count,
     }
-
-
-def minimal_graph_records(
-    records: list[dict[str, Any]],
-    path: Path,
-) -> list[dict[str, Any]]:
-    required = {
-        "scene_idx",
-        "keyframes",
-        "graph",
-        "parse_mode",
-        "semantic_warnings",
-    }
-    invalid = [
-        index
-        for index, row in enumerate(records)
-        if (
-            set(row) - {"provenance", "tokens"} != required
-        )
-    ]
-    if invalid:
-        raise ExtractionStepError(
-            f"incompatible graph scene output at rows {invalid[:10]}: {path}; "
-            "use --force or a new run_id"
-        )
-    from extraction.structured_output import validate_graph_structure, OutputValidationError
-
-    for row in records:
-        if not (
-            row.get("parse_mode") == "text" and isinstance(row.get("graph"), str)
-        ):
-            try:
-                validate_graph_structure(row["graph"])
-            except OutputValidationError as exc:
-                raise ExtractionStepError(f"invalid TOBE graph: {path}: {exc}") from exc
-    return records
-
-
-def minimal_description_records(
-    records: list[dict[str, Any]],
-    path: Path,
-) -> list[dict[str, Any]]:
-    required = {
-        "schema_version",
-        "content_id",
-        "scene_idx",
-        "keyframes",
-        "description",
-    }
-    invalid = [
-        index
-        for index, row in enumerate(records)
-        if set(row) - {"provenance", "tokens"} != required
-    ]
-    if invalid:
-        raise ExtractionStepError(
-            f"incompatible description scene output at rows {invalid[:10]}: {path}; "
-            "use --force or a new run_id"
-        )
-    from extraction.descriptions import SCENE_SCHEMA_VERSION
-
-    if any(
-        row.get("schema_version") != SCENE_SCHEMA_VERSION
-        or row.get("content_id") != path.stem
-        or not isinstance(row.get("description"), str)
-        or not row["description"].strip()
-        for row in records
-    ):
-        raise ExtractionStepError(f"invalid description scene: {path}")
-    return records
 
 
 def visual_rows(context: RunContext) -> list[dict[str, Any]]:

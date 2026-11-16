@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import yaml
-from arm_registry import EXPERIMENT_CONFIG_VERSION
 from visual_sampling import validate_sampling
 
 CONFIG_PATH = Path("config.yaml")
@@ -60,21 +59,12 @@ class RunContext:
             raise ConfigError("run_id must be a single non-empty directory name")
         config = _load_yaml(repo_root / CONFIG_PATH)
         _validate_config(config)
-        if dataset not in config["protocol"]["dataset"]:
-            raise ConfigError(f"unsupported dataset: {dataset!r}; choose from {DATASETS}")
+        if dataset not in config["datasets"]:
+            raise ConfigError(f"unsupported dataset: {dataset!r}; choose from {sorted(config['datasets'])}")
         artifact_root = _resolve(
             repo_root, config.get("artifacts_root", "artifacts"), "artifacts_root"
         )
         run_root = artifact_root / "runs" / selected / dataset
-        if dataset == "microlens_100k" and (
-            any((run_root.parent / name).exists() for name in ("extraction", "validation", "reports"))
-            or (artifact_root / "preparation" / "cohort").exists()
-        ):
-            raise ConfigError("legacy MicroLens layout found; run python -m preparation.migrate_dataset_layout --apply first")
-        for phase in ("scenes", "summaries"):
-            directory = run_root / "extraction" / phase
-            if any((directory / arm).exists() for arm in ("graph_qwen", "desc_qwen")):
-                raise ConfigError("legacy qwen extraction layout is unsupported; use a new run_id (no automatic migration)")
         return cls(repo_root, selected, config, run_root, artifact_root, dataset)
 
     def initialize(self) -> None:
@@ -97,7 +87,8 @@ class RunContext:
 
     @property
     def source_counts(self) -> dict[str, int]:
-        return self.config["datasets"][self.dataset]["source_counts"]
+        """Optional expected counts; used only for progress totals."""
+        return self.config["datasets"][self.dataset].get("source_counts", {})
 
     @property
     def preparation_dir(self) -> Path:
@@ -124,33 +115,13 @@ class RunContext:
     def source_assets_dir(self) -> Path:
         return self.evidence_dir / "source_assets"
 
-    def extraction_dir(self, representation: str, model: str, phase: str) -> Path:
-        if representation not in {"description", "graph"}:
-            raise ValueError(f"invalid representation: {representation}")
-        if model not in {"qwen3vl", "qwen3.5", "gemini", "minicpm"} or phase not in {"scenes", "summaries"}:
-            raise ValueError("invalid extraction model or phase")
-        if model == "minicpm" and (representation != "graph" or phase != "scenes"):
-            raise ValueError("MiniCPM supports only Graph scene extraction")
+    def extraction_dir(self, representation: str, model: str, phase: str = "scenes") -> Path:
         from arm_registry import generated_arm
 
-        if phase == "scenes":
-            return self.scene_arm_dir(generated_arm(self.config, representation, model).name)
-        return self.summary_arm_dir(generated_arm(self.config, representation, model).name)
+        return self.scene_arm_dir(generated_arm(representation, model).name)
 
     def scene_arm_dir(self, arm):
-        from arm_registry import generation_registry
-
-        selected = generation_registry(self.config)[arm]
-        if selected.model is None or selected.name != selected.scene_arm:
-            raise ValueError(f"not a Scene arm: {arm}")
-        return self.run_root / "extraction" / "scenes" / arm
-
-    def summary_arm_dir(self, arm):
-        from arm_registry import generation_registry
-
-        if generation_registry(self.config)[arm].model is None:
-            raise ValueError("Meta has no Summary artifacts")
-        return self.run_root / "extraction" / "summaries" / arm
+        return self.run_root / "extraction" / arm
 
     def graph_scene_dir(self, source: str) -> Path:
         return self.extraction_dir("graph", source, "scenes")
@@ -160,10 +131,8 @@ class RunContext:
 
     def prompt_path(self, schema: str | Path) -> Path:
         path = _resolve(self.root, str(schema), "--schema")
-        if path.suffix.lower() != ".md" or not path.is_file():
-            raise ValueError(f"--schema requires one existing Markdown prompt: {path}")
-        if not path.read_text(encoding="utf-8").strip():
-            raise ValueError(f"empty prompt: {path}")
+        if not path.is_file():
+            raise ValueError(f"--schema prompt not found: {path}")
         return path
 
     @property
@@ -184,7 +153,9 @@ class RunContext:
 
     def diagnosis_path(self, target) -> Path:
         from arm_registry import target_set
+        from rec_experiments import load_experiments
 
+        load_experiments(self)
         return self.diagnosis_dir / target_set(self.config, target) / "diagnosis.json"
 
     def path(self, section: str, key: str) -> Path:
@@ -192,192 +163,24 @@ class RunContext:
         return _resolve(self.root, values.get(key), f"{section}.{key}")
 
 
+def require_generation_config(config: dict[str, Any], representation: str, model: str) -> None:
+    """Fail before a generation step starts if its model was omitted from the config."""
+    missing = [
+        name for name, present in (
+            (f"models.{model}", model in config["models"]),
+            (f"extraction.{representation}.{model}", model in config["extraction"].get(representation, {})),
+        ) if not present
+    ]
+    if missing:
+        raise ConfigError(f"{model} {representation} generation requires {', '.join(missing)}")
+
+
 def _validate_config(value: dict[str, Any]) -> None:
-    expected_keys = {
-        "experiment_config_version",
-        "protocol",
-        "artifacts_root",
-        "datasets",
-        "models",
-        "extraction",
-        "validation",
-    }
-    if value.get("experiment_config_version") != EXPERIMENT_CONFIG_VERSION:
-        raise ConfigError(f"experiment_config_version must be {EXPERIMENT_CONFIG_VERSION}")
-    if set(value) != expected_keys:
-        raise ConfigError(f"pipeline config must contain exactly {sorted(expected_keys)}")
-    _validate_protocol(value)
-    _validate_extraction(value)
-    _validate_models(value)
-    _validate_validation(value)
-
-
-def _validate_protocol(value: dict[str, Any]) -> None:
-    from arm_registry import active_arms
-
-    protocol = _require_mapping(value, "protocol")
-    expected = {
-        "dataset": list(DATASETS),
-        "modality": "visual_only",
-        "sampling": "fixed_windows",
-        "cohort_sampling": "leave_one_out",
-        "catalog_scope": "retained_sequence_catalog",
-        "graph_extractors": ["qwen3vl", "qwen3.5", "gemini"],
-        "description_extractors": ["qwen3vl", "qwen3.5", "gemini"],
-    }
-    if "minicpm" in value.get("models", {}):
-        expected["graph_extractors"] = [*expected["graph_extractors"], "minicpm"]
-    if set(protocol) != set(expected):
-        raise ConfigError("invalid protocol keys")
-    for key, setting in expected.items():
-        if protocol.get(key) != setting:
-            raise ConfigError(f"protocol.{key} must be {setting!r}")
-    try:
-        active_arms(value)
-    except (ValueError, TypeError, KeyError) as exc:
-        raise ConfigError(str(exc)) from exc
-
-
-def _validate_extraction(value: dict[str, Any]) -> None:
-    from extraction.qwen_config import qwen_settings
-
-    extraction = _require_mapping(value, "extraction")
-    try:
-        qwen_settings(extraction.get("qwen"))
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-    if set(extraction) - {"qwen"} != {"visual_evidence", "graph", "description", "gemini"}:
-        raise ConfigError("extraction must contain visual_evidence, graph, description, gemini and optional qwen engine settings")
-    visual_evidence = _require_mapping(extraction, "visual_evidence")
-    if set(visual_evidence) != {"image_resolution", "scene_duration", "num_keyframes"}:
-        raise ConfigError(
-            "extraction.visual_evidence must contain image_resolution, scene_duration, and num_keyframes"
-        )
+    """Only check what every step needs to start; everything else is read where it is used."""
+    for key in ("datasets", "models", "extraction", "validation"):
+        _require_mapping(value, key)
+    visual_evidence = _require_mapping(value["extraction"], "visual_evidence")
     try:
         validate_sampling(visual_evidence["scene_duration"], visual_evidence["num_keyframes"])
-    except ValueError as exc:
+    except (KeyError, ValueError) as exc:
         raise ConfigError(f"extraction.visual_evidence: {exc}") from exc
-    resolution = visual_evidence.get("image_resolution")
-    if (
-        not isinstance(resolution, list)
-        or len(resolution) != 2
-        or any(
-            (
-                not isinstance(value, int) or isinstance(value, bool) or value <= 0
-                for value in resolution
-            )
-        )
-    ):
-        raise ConfigError(
-            "extraction.visual_evidence.image_resolution must be two positive integers"
-        )
-    generation_keys = {"scene_max_new_tokens", "summary_max_new_tokens"}
-    for arm in ("graph", "description"):
-        models = _require_mapping(extraction, arm)
-        expected_models = {"qwen3vl", "qwen3.5", "gemini"}
-        if arm == "graph" and "minicpm" in value.get("models", {}):
-            expected_models.add("minicpm")
-        if set(models) != expected_models:
-            raise ConfigError(f"extraction.{arm} must contain exactly {sorted(expected_models)}")
-        for model in sorted(expected_models):
-            settings = _require_mapping(models, model)
-            keys = {"scene_max_new_tokens"} if model == "minicpm" else generation_keys
-            if set(settings) != keys:
-                raise ConfigError(
-                    f"extraction.{arm}.{model} must contain exactly {sorted(keys)}"
-                )
-            for key in keys:
-                setting = settings.get(key)
-                if not isinstance(setting, int) or isinstance(setting, bool) or setting <= 0:
-                    raise ConfigError(f"extraction.{arm}.{model}.{key} must be a positive integer")
-    gemini = _require_mapping(extraction, "gemini")
-    if set(gemini) != {"threads"}:
-        raise ConfigError("extraction.gemini must contain exactly threads")
-    if type(gemini["threads"]) is not int or gemini["threads"] <= 0:
-        raise ConfigError("extraction.gemini.threads must be a positive integer")
-    _require_mapping(value, "validation")
-
-
-def _validate_models(value: dict[str, Any]) -> None:
-    datasets = _require_mapping(value, "datasets")
-    if set(datasets) != set(DATASETS):
-        raise ConfigError(f"datasets must contain exactly {DATASETS}")
-    count_keys = {"user_count", "interaction_count", "item_count"}
-    for name in DATASETS:
-        profile = _require_mapping(datasets, name)
-        if set(profile) != {"data", "source_counts"}:
-            raise ConfigError(f"datasets.{name} requires data and source_counts")
-        data = _require_mapping(profile, "data")
-        counts = _require_mapping(profile, "source_counts")
-        if set(counts) != count_keys or any(type(n) is not int or n <= 0 for n in counts.values()):
-            raise ConfigError(f"invalid datasets.{name}.source_counts")
-        required_data = {"root"} if name == "m3l_10m" else {"videos_dir", "pairs_tsv", "titles_csv", "pairs_csv"}
-        optional_data = set() if name == "m3l_10m" else {"titles_supplement_csv"}
-        if not required_data <= set(data) or set(data) - required_data - optional_data:
-            raise ConfigError(f"invalid datasets.{name}.data keys")
-        if any(not isinstance(p, str) or not p.strip() for p in data.values()):
-            raise ConfigError(f"datasets.{name}.data paths must be non-empty strings")
-    models = _require_mapping(value, "models")
-    required = {"qwen3vl", "qwen3.5", "bge", "gemini"}
-    if not required <= set(models) or set(models) - required - {"minicpm"}:
-        raise ConfigError("models must contain qwen3vl, qwen3.5, bge, gemini and optional minicpm")
-    local_models = ["qwen3vl", "qwen3.5", "bge"]
-    if "minicpm" in models:
-        local_models.append("minicpm")
-    for key in local_models:
-        if not isinstance(models[key], str) or not models[key].strip():
-            raise ConfigError(f"models.{key} must be a non-empty local checkpoint path")
-    gemini = _require_mapping(models, "gemini")
-    gemini_keys = {
-        "project_id",
-        "location",
-        "model_id",
-        "temperature",
-        "thinking_level",
-        "media_resolution",
-    }
-    if set(gemini) != gemini_keys:
-        raise ConfigError(f"models.gemini must contain exactly {sorted(gemini_keys)}")
-    for key in ("project_id", "location", "model_id"):
-        if not isinstance(gemini.get(key), str) or not gemini[key].strip():
-            raise ConfigError(f"models.gemini.{key} must be a non-empty string")
-    temperature = gemini.get("temperature")
-    if (
-        not isinstance(temperature, (int, float))
-        or isinstance(temperature, bool)
-        or (not 0 <= temperature <= 2)
-    ):
-        raise ConfigError("models.gemini.temperature must be a number from 0 to 2")
-    if gemini.get("thinking_level") not in {"low", "medium", "high"}:
-        raise ConfigError("models.gemini.thinking_level must be low, medium, or high")
-    media_resolutions = {
-        "MEDIA_RESOLUTION_UNSPECIFIED",
-        "MEDIA_RESOLUTION_LOW",
-        "MEDIA_RESOLUTION_MEDIUM",
-        "MEDIA_RESOLUTION_HIGH",
-    }
-    if gemini.get("media_resolution") not in media_resolutions:
-        raise ConfigError(
-            f"models.gemini.media_resolution must be one of {sorted(media_resolutions)}"
-        )
-
-
-def _validate_validation(value: dict[str, Any]) -> None:
-    validation = _require_mapping(value, "validation")
-    expected_validation_keys = {"cohort", "encoder", "model", "evaluation"}
-    if set(validation) - {"graph_execution"} != expected_validation_keys:
-        raise ConfigError(f"validation requires {sorted(expected_validation_keys)} and optional graph_execution")
-    try:
-        from pydantic import ValidationError
-        from validation.config import build_validation_config
-
-        for profile in value["datasets"].values():
-            build_validation_config(
-                run_id="config-validation",
-                dataset=profile["data"],
-                settings={**validation, "encoder": _require_mapping(validation, "encoder")},
-                model_path=value["models"].get("bge"),
-                output_dir=value.get("artifacts_root"),
-            )
-    except ValidationError as exc:
-        raise ConfigError(f"invalid validation config: {exc}") from exc

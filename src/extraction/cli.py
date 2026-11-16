@@ -16,52 +16,58 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Regenerate all outputs for this step, including completed summaries.",
+        help="Regenerate all scenes for this step, including completed scenes.",
     )
     parser.add_argument("--schema", help="Path to one Markdown prompt (required for generation).")
     parser.add_argument(
         "--model",
         choices=GRAPH_SOURCES,
-        help="Required generation model for extraction and summarization.",
+        help="Required generation model for scene extraction.",
     )
     parser.add_argument(
         "--repetition-penalty",
         type=float,
-        help="Local vLLM generated-token repetition penalty in [1, 2]. Defaults: Graph scenes 1.05; Description scenes and summaries 1.0.",
+        nargs="+",
+        help="Local vLLM generated-token repetition penalty in [1, 2]. Defaults: Graph scenes 1.05; "
+        "Description scenes 1.0. Several values run one pass each: the first pass covers every "
+        "pending scene and each later pass retries the scenes that did not succeed.",
     )
     parser.add_argument(
         "--presence-penalty",
         type=float,
-        help="Local vLLM presence penalty in [-2, 2]. Defaults: scenes 1.5; summaries 2.0. Use 0 to disable.",
+        help="Local vLLM presence penalty in [-2, 2]. Defaults: Graph scenes 0; Description scenes 1.5. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--stop-repeated-lines",
+        action="store_true",
+        help="Local vLLM Graph scenes only: end the output instead of writing a line identical "
+        "to an earlier line (the repeated line is dropped). Off by default.",
     )
     parser.add_argument(
         "--arm",
-        help="Generation source; minicpm Graph scenes default to graph_minicpm. Other models require --arm.",
+        help="Optional generation source; defaults to the one set by --model and the extraction step.",
     )
     args = parser.parse_args(argv)
     try:
         if args.schema is None:
             raise ValueError(f"{args.step} requires --schema PATH.md")
-        if args.model == "minicpm":
-            if args.step != "extract-graph-scenes":
-                raise ValueError("MiniCPM supports only extract-graph-scenes")
-            if args.arm is None:
-                args.arm = "graph_minicpm"
-            elif args.arm != "graph_minicpm":
-                raise ValueError("minicpm Graph scenes require --arm graph_minicpm")
-        if args.step == "summarize" and args.arm == "graph_minicpm":
-            raise ValueError("MiniCPM source supports only Graph scene extraction")
-        if args.model is None or args.arm is None:
-            raise ValueError("generation requires --model and --arm")
+        if args.model is None:
+            raise ValueError("generation requires --model")
         options = {}
         if args.repetition_penalty is not None:
             if args.model not in LOCAL_MODELS:
                 raise ValueError("--repetition-penalty is supported only for local vLLM models")
-            options["repetition_penalty"] = penalty_schedule([args.repetition_penalty])[0]
+            schedule = penalty_schedule(args.repetition_penalty)
+            # One value keeps the single-penalty form so existing generation identities match.
+            options["repetition_penalty"] = schedule[0] if len(schedule) == 1 else schedule
         if args.presence_penalty is not None:
             if args.model not in LOCAL_MODELS:
                 raise ValueError("--presence-penalty is supported only for local vLLM models")
             options["presence_penalty"] = validate_presence_penalty(args.presence_penalty)
+        if args.stop_repeated_lines:
+            if args.model not in LOCAL_MODELS or args.step != "extract-graph-scenes":
+                raise ValueError("--stop-repeated-lines is supported only for local vLLM Graph scenes")
+            options["stop_repeated_lines"] = True
         context = RunContext.load(args.run_id, dataset=args.dataset)
         result = STEP_HANDLERS[args.step](
             context,

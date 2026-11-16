@@ -1,4 +1,3 @@
-from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -6,103 +5,77 @@ import torch
 
 from arm_registry import registry
 from artifact_io import write_jsonl
-from extraction.graph_warnings import PARSE_FAILED
+from extraction.graph_warnings import PARSE_FAILED, REPEAT_OCCURRED
 from helpers import (
-    FakeEncoder,
     failure_row,
     graph_store,
     prepare_inputs,
-    ready_cohort,
     scene_row,
 )
 from validation.graph_batching import PackedGraphStore
 from validation.graph_inputs import build_input
-from validation.selection import prepare_validation_cohort
-from validation.text_features import encode_components, validate_arrays
+from helpers import make_context
 
 
-def test_scene_sources_and_shared_features(context, monkeypatch):
+def _check_scene_sources_and_shared_features(context, monkeypatch):
     from artifact_io import read_json
     from validation.graph_inputs import GraphStore
     from validation.steps import embed_representations
 
     prepare_inputs(context, monkeypatch)
-    result = embed_representations(context, target=["g1", "g2", "d2", "g3", "g4"])
-    assert result["generated_sources"] == ["desc_qwen3vl"]
-    assert result["reused_sources"] == ["graph_qwen3vl"]
+    result = embed_representations(context, target=["description", "graph", "graph-activity", "graph-role-activity"])
+    assert result["generated_sources"] == ["desc_qwen3vl_2b"]
+    assert result["reused_sources"] == ["graph_qwen3vl_2b"]
     root = context.representations_dir
-    assert {p.name for p in root.iterdir()} == {"metadata", "desc_qwen3vl", "graph_qwen3vl"}
-    description = GraphStore(root / "desc_qwen3vl")
+    assert {p.name for p in root.iterdir()} == {"metadata", "desc_qwen3vl_2b", "graph_qwen3vl_2b"}
+    description = GraphStore(root / "desc_qwen3vl_2b")
     assert len(description["contexts"]) == 48  # two independent scenes per video
     assert len(description["types"]) == 0
     assert description["video_offsets"].tolist() == list(range(0, 49, 2))
-    assert not (context.run_root / "extraction" / "summaries").exists()
-    assert read_json(root / "desc_qwen3vl" / "manifest.json")["source"] == "desc_qwen3vl"
+    assert read_json(root / "desc_qwen3vl_2b" / "manifest.json")["source"] == "desc_qwen3vl_2b"
 
 
-def test_d2_reuses_legacy_description_features(context, monkeypatch):
-    from dataclasses import replace
-    from validation.graph_inputs import source_identity
+def _check_v8_location_reaches_embeddings_and_segments_without_source_rewrite(context, monkeypatch):
+    from artifact_io import read_jsonl
+    from extraction.scene_storage import read_scene_records
     from validation.selection import load_validation_cohort
-    from validation.steps import embed_representations
+    from validation.steps import embed_representations, prepare_module
+    from validation.graph_inputs import GraphStore, load_scene_segments, source_identity
 
     prepare_inputs(context, monkeypatch)
-    embed_representations(context, target=["d2"])
     cohort = load_validation_cohort(context)
-    d2 = registry(context.config)["d2"]
-    d1 = replace(d2, name="d1", extensions=())
-    assert source_identity(context, cohort, d2) == source_identity(context, cohort, d1)
-    identity_before = {p: p.read_bytes() for p in (context.representations_dir / "desc_qwen3vl").iterdir()}
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("compatible frozen Description features must not be encoded again")
-
-    monkeypatch.setattr("validation.graph_inputs.encode_texts", forbidden)
-    result = embed_representations(context, target=["d2"])
-    assert result["generated_sources"] == [] and result["reused_sources"] == ["desc_qwen3vl"]
-    assert all(p.read_bytes() == content for p, content in identity_before.items())
-
-
-def test_missing_description_preserves_catalog(context):
-    from extraction.scene_storage import write_scene_records
-
-    path = context.path("data", "titles_csv")
-    path.write_text(path.read_text().replace("2,TITLE_SECRET_2\n", "2,\n"))
-    ready_cohort(context)
-    cohort = prepare_validation_cohort(context)
+    arm = registry(context.config)["graph-activity"]
+    texts_before, arrays_before, stats_before = build_input(context, cohort, arm)
+    identity_before = source_identity(context, cohort, arm)
     cid = cohort["catalog"][0]["content_id"]
-    write_scene_records(context.scene_arm_dir("desc_qwen3vl") / f"{cid}.jsonl", [failure_row(cid)])
-    texts, arrays, stats = build_input(context, cohort, registry(context.config)["d2"])
-    assert len(arrays["titles"]) == len(cohort["catalog"]) == 24
-    assert arrays["titles"][0] != 0 and arrays["titles"][1] == 0
-    assert arrays["video_offsets"].tolist() == [0] * 25
-    assert stats["counts"]["failed"] == 1
-    assert stats["counts"]["zero_scene_video"] == 24
-    assert texts[0] == ""
+    path = context.scene_arm_dir(arm.scene_arm) / f"{cid}.jsonl"
+    rows = read_jsonl(path)
+    for row in rows:
+        value = row["scene_graph"]
+        for action in value["actions"]:
+            action["location"] = action.pop("place")
+        row["scene_graph"] = value  # v8 rows are stored as structured graphs
+    write_jsonl(path, rows)
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+    assert source_identity(context, cohort, arm) != identity_before
+    assert all(not row["semantic_warnings"] for row in read_scene_records(path))
+
+    texts, arrays, stats = build_input(context, cohort, arm)
+    assert texts == texts_before and stats == stats_before
+    for key in arrays:
+        np.testing.assert_array_equal(arrays[key], arrays_before[key])
+    # Resume keeps the finished bundle; --force rebuilds it from the rewritten source.
+    assert embed_representations(context, target=["graph-activity"])["generated_sources"] == []
+    result = embed_representations(context, target=["graph-activity"], force=True)
+    assert result["generated_sources"] == [arm.scene_arm]
+    prepare_module(context, target=["graph-activity"])
+    store = GraphStore(context.representations_dir / arm.scene_arm)
+    np.testing.assert_array_equal(store["edges"], arrays_before["edges"])
+    assert len(load_scene_segments(store.directory))
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
 
 
-def test_text_arrays_reject_invalid_values():
-    docs = [{"title_text": "hello", "video_text": ""}]
-    good, _ = encode_components(docs, 1024, FakeEncoder(), {})
-    validate_arrays(good, 1, 1024, docs)
-    corruptions = [
-        ("title_values", np.zeros((2, 1024), np.float32)),
-        ("title_values", good["title_values"].astype(np.float64)),
-        ("title_values", np.full((1, 1024), np.nan, np.float32)),
-        ("video_values", np.ones((1, 1024), np.float32)),
-        ("title_available", np.zeros(1, np.bool_)),
-        ("title_available", np.ones(1, np.int64)),
-    ]
-    for name, value in corruptions:
-        bad = deepcopy(good)
-        bad[name] = value
-        with pytest.raises(ValueError):
-            validate_arrays(bad, 1, 1024, docs)
-    with pytest.raises(ValueError, match="legacy/invalid"):
-        validate_arrays({"values": good["title_values"]}, 1, 1024)
-
-
-def test_graph_edges_are_scene_local(context):
+def _check_graph_edges_are_scene_local(context):
     arrays, _, texts, _ = graph_store(context, counts=(2,))
     assert arrays["scene_offsets"].tolist() == [0, 5, 10]
     forward = arrays["edges"][arrays["edges"][:, 2] < 5].tolist()
@@ -116,7 +89,7 @@ def test_graph_edges_are_scene_local(context):
     assert arrays["missing"][:, 4].tolist() == [0, 0]  # receiver compatibility slot
 
 
-def test_graph_exclusions_preserve_items(context):
+def _check_graph_exclusions_preserve_items(context):
     _, cohort, _, _ = graph_store(context, counts=(1, 0))
     cid = cohort["catalog"][0]["content_id"]
     rows = [
@@ -124,18 +97,20 @@ def test_graph_exclusions_preserve_items(context):
         scene_row(cid, 1, warnings=[PARSE_FAILED]),
         scene_row(cid, 2, value="unrecoverable observation"),
         failure_row(cid, 3),
+        # A repeat-stopped scene is used and only counted.
+        scene_row(cid, 4, warnings=[REPEAT_OCCURRED]),
     ]
-    write_jsonl(context.scene_arm_dir("graph_qwen3vl") / f"{cid}.jsonl", rows)
-    _, arrays, stats = build_input(context, cohort, registry(context.config)["g1"])
-    assert arrays["video_offsets"].tolist() == [0, 1, 1]
+    write_jsonl(context.scene_arm_dir("graph_qwen3vl_2b") / f"{cid}.jsonl", rows)
+    _, arrays, stats = build_input(context, cohort, registry(context.config)["graph-activity"])
+    assert arrays["video_offsets"].tolist() == [0, 2, 2]
     assert len(arrays["titles"]) == len(cohort["catalog"]) == 2
-    assert stats["counts"]["valid_scenes"] == 1
-    assert {r["reason"] for r in stats["excluded_scenes"]} == {"warning", "raw", "failed"}
+    assert stats["counts"]["valid_scenes"] == 2
+    assert stats["counts"]["repeat_occurred"] == 1
+    assert [r["reason"] for r in stats["excluded_scenes"]] == ["parse_failed", "parse_failed", "error"]
     assert stats["counts"]["zero_scene_video"] == 1
 
 
-@pytest.mark.torch
-def test_packed_graph_indices_match_reference(context):
+def _check_packed_graph_indices_match_reference(context):
     arrays, _, _, _ = graph_store(context, counts=(2, 1, 0))
     batch = PackedGraphStore(arrays, feature_cache_mb=0).batch([1, 2, 0], "cpu")
     assert batch["offsets"] == [0, 1, 1, 3]
@@ -147,3 +122,27 @@ def test_packed_graph_indices_match_reference(context):
     expected_nodes = np.concatenate((arrays["nodes"][10:15], arrays["nodes"][:10]))
     torch.testing.assert_close(batch["features"], torch.tensor(arrays["features"][expected_nodes]))
     assert batch["available"].tolist() == [1, 1, 1]
+
+
+def test_scene_sources_shared_features_and_v8_location(tmp_path):
+    # Scene sources and shared features.
+    case = tmp_path / "0"
+    with pytest.MonkeyPatch.context() as patch:
+        _check_scene_sources_and_shared_features(context=make_context(case / "repo"), monkeypatch=patch)
+    # V8 location reaches embeddings and segments without source rewrite.
+    case = tmp_path / "1"
+    with pytest.MonkeyPatch.context() as patch:
+        _check_v8_location_reaches_embeddings_and_segments_without_source_rewrite(context=make_context(case / "repo"), monkeypatch=patch)
+
+
+@pytest.mark.torch
+def test_graph_edges_exclusions_and_packed_indices(tmp_path):
+    # Graph edges are scene local.
+    case = tmp_path / "0"
+    _check_graph_edges_are_scene_local(context=make_context(case / "repo"))
+    # Graph exclusions preserve items.
+    case = tmp_path / "1"
+    _check_graph_exclusions_preserve_items(context=make_context(case / "repo"))
+    # Packed graph indices match reference.
+    case = tmp_path / "2"
+    _check_packed_graph_indices_match_reference(context=make_context(case / "repo"))

@@ -32,42 +32,39 @@ class WorkerOutput(io.TextIOBase):
 
 
 def combination_worker(
-    context, device_name, jobs, results, profile_every=None, profile_operators=False
+    context, device_name, jobs, results
 ):
     # The parent owns Ctrl-C and terminates/joins all its children on interruption.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     output = WorkerOutput(results)
     with redirect_stdout(output), redirect_stderr(output):
         try:
-            _consume_combinations(context, device_name, jobs, results, profile_every, profile_operators)
+            _consume_combinations(context, device_name, jobs, results)
         finally:
             output.flush()
 
 
 def _consume_combinations(
-    context, device_name, jobs, results, profile_every=None, profile_operators=False
+    context, device_name, jobs, results
 ):
     identity = None
     try:
         from validation.model import torch
         from validation.leave_one_out_data import EventTable
-        from validation.selection import load_validation_cohort, training_signature
+        from validation.selection import load_validation_cohort
         from validation.leave_one_out_recommendation import prepare_split, run_combination
-        from validation.steps import validation_config
+        from validation.config import validation_config
 
         torch.set_num_threads(1)
         device = torch.device(device_name)
         if device.type == "cuda":
             torch.cuda.set_device(device)
         config = validation_config(context)
-        cohort = load_validation_cohort(context, verify_current=False)
+        cohort = load_validation_cohort(context)
         table = EventTable(cohort["events"])
-        expected_training_hash = training_signature(context, cohort, config)
         previous_split, prepared = None, None
         while (job := jobs.get()) is not None:
             split, identity, branch = job
-            if identity["training_input_hash"] != expected_training_hash:
-                raise ValueError("validation selection changed during worker startup")
             if split["split_hash"] != previous_split:
                 prepared = prepare_split(table, split)
                 previous_split = split["split_hash"]
@@ -80,8 +77,6 @@ def _consume_combinations(
                 branch,
                 prepared,
                 device,
-                **({"profile_every": profile_every} if profile_every is not None else {}),
-                **({"profile_operators": True} if profile_operators else {}),
             )
             results.put(("complete", identity))
     except BaseException:
@@ -91,7 +86,7 @@ def _consume_combinations(
 
 
 def run_parallel(
-    context, jobs, devices, progress, *, profile_every=None, profile_operators=False
+    context, jobs, devices, progress
 ):
     # CUDA must be initialized in spawned children, never inherited through fork.
     runtime = mp.get_context("spawn")
@@ -107,10 +102,6 @@ def run_parallel(
             process = runtime.Process(
                 target=combination_worker,
                 args=(context, device, pending, results),
-                kwargs={
-                    **({"profile_every": profile_every} if profile_every is not None else {}),
-                    **({"profile_operators": True} if profile_operators else {}),
-                },
             )
             process.start()
             processes.append(process)

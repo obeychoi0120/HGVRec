@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from extraction.backends.qwen_penalty import PENALTY_KEY
+from extraction.backends.qwen_repeat import REPEAT_STOP_KEY, drop_repeated_last_line
 from extraction.evidence import load_images
-from extraction.qwen_config import qwen_settings, validate_checkpoint
+from extraction.qwen_config import qwen_settings
 
 
 @dataclass
@@ -20,34 +21,18 @@ class QwenOutput:
     output_tokens: int
     finish_reason: str | None = None
     stop_reason: str | int | None = None
+    # The output stopped before repeating an earlier line, which was dropped.
+    repeat_stopped: bool = False
 
 
 @dataclass
 class QwenBackend:
-    label = "Qwen"
-    dependency_extra = "qwen"
     engine: Any
     processor: Any
     model_id: str
     executor: ThreadPoolExecutor
     stop_token_ids: list[int]
     runtime_info: dict[str, Any]
-
-    @classmethod
-    def checkpoint_model(cls, config):
-        family = {"qwen3_vl": "qwen3vl", "qwen3_5": "qwen3.5"}.get(config.get("model_type"))
-        validate_checkpoint(family, config)
-        return family
-
-    @classmethod
-    def engine_options(cls):
-        return {}
-
-    def validate_task(self, task, config):
-        validate_checkpoint(task.model, config)
-
-    def template_options(self, task):
-        return {"enable_thinking": task.enable_thinking} if task.enable_thinking is not None else {}
 
     @classmethod
     def from_pretrained(cls, model_path: str, *, settings=None, image_limit=6):
@@ -58,15 +43,11 @@ class QwenBackend:
             from vllm.v1.engine.async_llm import AsyncLLM
         except ImportError as exc:
             raise RuntimeError(
-                f"{cls.label} requires Linux/CUDA and the '{cls.dependency_extra}' optional dependencies"
+                "Qwen requires Linux/CUDA and vLLM; pip install -r requirements-main.txt"
             ) from exc
         model_dir = Path(model_path)
         if not model_dir.is_dir():
-            raise ValueError(f"{cls.label} local checkpoint directory is missing: {model_path}")
-        config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
-        if config.get("quantization_config"):
-            raise ValueError(f"{cls.label} vLLM pipeline requires a non-quantized BF16 checkpoint")
-        family = cls.checkpoint_model(config)
+            raise ValueError(f"Qwen local checkpoint directory is missing: {model_path}")
         resolved = qwen_settings(settings)
         processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
         generation_path = model_dir / "generation_config.json"
@@ -86,18 +67,20 @@ class QwenBackend:
             "tensor_parallel_size": 1,
             "generation_config": "vllm",
             "limit_mm_per_prompt": {"image": image_limit, "video": 0},
-            "logits_processors": ["extraction.backends.qwen_logits:GeneratedTokenLogitsProcessor"],
+            "logits_processors": [
+                "extraction.backends.qwen_logits:GeneratedTokenLogitsProcessor",
+                "extraction.backends.qwen_logits:RepeatedLineStopLogitsProcessor",
+            ],
             "structured_outputs_config": {"backend": "xgrammar"},
             "enable_log_requests": False,
             "disable_log_stats": True,
-            **cls.engine_options(),
         }
         if arguments["max_model_len"] == "auto":
             arguments["max_model_len"] = -1
         engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**arguments))
         try:
             if not callable(getattr(engine.renderer, "render_cmpl_async", None)):
-                raise RuntimeError(f"vLLM renderer API is incompatible with the {cls.label} backend")
+                raise RuntimeError("vLLM renderer API is incompatible with the Qwen backend")
             actual = {
                 **resolved,
                 "max_model_len": engine.model_config.max_model_len,
@@ -111,11 +94,10 @@ class QwenBackend:
                 "generation_config": "vllm",
                 "logits_processors": arguments["logits_processors"],
                 "structured_outputs_config": arguments["structured_outputs_config"],
-                **cls.engine_options(),
             }
             info = {
                 "backend": "vllm",
-                "model_family": family,
+                "model_family": "qwen3vl",
                 "versions": {name: version(name) for name in ("vllm", "torch", "transformers")},
                 "cuda_version": torch.version.cuda,
                 "gpu_name": torch.cuda.get_device_name(0),
@@ -139,15 +121,10 @@ class QwenBackend:
         try:
             content = [{"type": "image", "image": image} for image in images]
             content.append({"type": "text", "text": task.prompt})
-            if task.model is not None:
-                import json
-                self.validate_task(task, json.loads((Path(self.model_id) / "config.json").read_text()))
-            template_options = self.template_options(task)
             prompt = self.processor.apply_chat_template(
                 [{"role": "user", "content": content}],
                 tokenize=False,
                 add_generation_prompt=True,
-                **template_options,
             )
             inputs = {"prompt": prompt}
             if images:
@@ -169,6 +146,11 @@ class QwenBackend:
             from vllm.sampling_params import StructuredOutputsParams
 
             structured = StructuredOutputsParams(**task.structured_output)
+        extra_args = {PENALTY_KEY: task.repetition_penalty}
+        if task.stop_repeated_lines:
+            if not self.stop_token_ids:
+                raise ValueError("stopping before a repeated line requires a stop token id")
+            extra_args[REPEAT_STOP_KEY] = self.stop_token_ids[0]
         return SamplingParams(
             n=1,
             temperature=task.temperature if task.do_sample else 0.0,
@@ -180,7 +162,7 @@ class QwenBackend:
             presence_penalty=task.presence_penalty,
             min_p=task.min_p,
             frequency_penalty=0.0,
-            extra_args={PENALTY_KEY: task.repetition_penalty},
+            extra_args=extra_args,
             structured_outputs=structured,
             stop_token_ids=self.stop_token_ids,
             ignore_eos=False,
@@ -231,15 +213,19 @@ class QwenBackend:
             if final is None or len(final.outputs) != 1:
                 raise RuntimeError("vLLM did not return one completed output")
             result = final.outputs[0]
+            text = result.text
+            if task.stop_repeated_lines and getattr(result, "finish_reason", None) == "stop":
+                text = drop_repeated_last_line(text)
             return QwenOutput(
-                result.text,
+                text,
                 prompt_length,
                 len(result.token_ids),
                 getattr(result, "finish_reason", None),
                 getattr(result, "stop_reason", None),
+                repeat_stopped=text != result.text,
             )
         except Exception as exc:
-            raise RuntimeError(f"{self.label} task {task.task_id}: {exc}") from exc
+            raise RuntimeError(f"Qwen task {task.task_id}: {exc}") from exc
         finally:
             for image in images:
                 image.close()

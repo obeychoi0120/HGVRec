@@ -1,4 +1,4 @@
-"""Small source data and external-runtime doubles; production contracts stay real."""
+"""Small source data and external-runtime doubles; production code paths stay real."""
 
 from contextlib import contextmanager
 from copy import deepcopy
@@ -13,8 +13,6 @@ from PIL import Image
 import yaml
 
 from artifact_io import read_json, read_jsonl, write_json
-from arm_registry import generation_registry
-from extraction.qwen_config import generation_settings
 from extraction.scene_storage import write_scene_records
 from pipeline_runtime import RunContext
 from preparation.cohort import prepare_full_cohort
@@ -22,7 +20,17 @@ from validation.leave_one_out_data import EventTable
 from visual_sampling import timestamp_stem
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ["base", "g1"]
+TARGETS = ["base", "graph-activity"]
+TEST_EXPERIMENTS = """version: 1
+defaults:
+  readout: mean
+experiments:
+  - {label: base, source: metadata, modules: []}
+  - {label: description, source: desc_qwen3vl_2b, modules: []}
+  - {label: graph, source: graph_qwen3vl_2b, modules: []}
+  - {label: graph-activity, source: graph_qwen3vl_2b, modules: [ASHA]}
+  - {label: graph-role-activity, source: graph_qwen3vl_2b, modules: [REAF, ASHA]}
+"""
 GRAPH_TEXT = """[Context]
 medium: live_action
 format: demonstration
@@ -104,7 +112,7 @@ def events(lengths=(5, 6, 13)):
 
 def make_context(root, lengths=(5, 6, 13)):
     root.mkdir(parents=True, exist_ok=True)
-    config = deepcopy(yaml.safe_load((ROOT / "config.yaml").read_text()))
+    config = deepcopy(yaml.safe_load((ROOT / "config.example.yaml").read_text()))
     rows = events(lengths)
     data = root / "data"
     videos = data / "videos"
@@ -121,17 +129,17 @@ def make_context(root, lengths=(5, 6, 13)):
         (videos / f"{row['item_id']}.mp4").write_bytes(b"decoder-double input")
     config["datasets"]["microlens_100k"]["data"] = {
         "pairs_csv": str(data / "pairs.csv"),
-        "pairs_tsv": str(data / "absent.tsv"),
         "titles_csv": str(data / "titles.csv"),
         "titles_supplement_csv": str(data / "supplement.csv"),
         "videos_dir": str(videos),
     }
-    for name, kind, architecture in (
-        ("qwen3vl", "qwen3_vl", "Qwen3VLForConditionalGeneration"),
-        ("qwen3.5", "qwen3_5", "Qwen3_5ForConditionalGeneration"),
-        ("bge", "bert", "BertModel"),
+    for name, directory, kind, architecture in (
+        ("qwen3vl_2b", "Qwen3-VL-2B-Instruct", "qwen3_vl", "Qwen3VLForConditionalGeneration"),
+        ("qwen3vl_4b", "Qwen3-VL-4B-Instruct", "qwen3_vl", "Qwen3VLForConditionalGeneration"),
+        ("qwen3vl_8b", "Qwen3-VL-8B-Instruct", "qwen3_vl", "Qwen3VLForConditionalGeneration"),
+        ("bge", "bge", "bert", "BertModel"),
     ):
-        path = root / "models" / name
+        path = root / "models" / directory
         path.mkdir(parents=True)
         write_json(
             path / "config.json",
@@ -141,9 +149,6 @@ def make_context(root, lengths=(5, 6, 13)):
     config["models"]["gemini"].update(project_id="offline-project")
     config["artifacts_root"] = str(root / "artifacts")
     settings = config["validation"]
-    config["datasets"]["microlens_100k"]["source_counts"].update(
-        user_count=len(lengths), interaction_count=len(rows), item_count=len(rows)
-    )
     settings["model"].update(max_epochs=2, batch_size=8, dropout=0.0, deterministic=True)
     settings["evaluation"]["bootstrap_samples"] = 32
     settings["graph_execution"].update(feature_cache_mb=0, checkpoint="never")
@@ -151,13 +156,18 @@ def make_context(root, lengths=(5, 6, 13)):
     prompts = root / "prompts"
     prompts.mkdir()
     for name in (
-        "scene_graph_v9.md",
-        "summary_graph_v9.md",
-        "scene_description_v3.md",
-        "summary_description_v5.md",
+        "scene_graph_v9_core.md",
+        "scene_graph_v9_extended.md",
+        "scene_description_dwys.md",
     ):
         (prompts / name).write_text((ROOT / "prompts" / name).read_text())
-    return RunContext.load("regression", dataset="microlens_100k", root=root)
+    # A fixed experiment list, not the repository's: that file is git-ignored and edited per Run.
+    (root / "rec_experiments_config.yaml").write_text(TEST_EXPERIMENTS)
+    context = RunContext.load("regression", dataset="microlens_100k", root=root)
+    from rec_experiments import load_experiments
+
+    load_experiments(context)
+    return context
 
 
 def ready_cohort(context):
@@ -184,9 +194,10 @@ class FakeEncoder:
 
 
 class FakeGenerator:
-    def __init__(self, text=GRAPH_TEXT, *, finish_reason="stop"):
+    def __init__(self, text=GRAPH_TEXT, *, finish_reason="stop", repeat_stopped=False):
         self.text = text
         self.finish_reason = finish_reason
+        self.repeat_stopped = repeat_stopped
         self.tasks = []
 
     @contextmanager
@@ -200,6 +211,8 @@ class FakeGenerator:
                     runtime.current_result = {
                         "output_tokens": 19,
                         "finish_reason": self.finish_reason,
+                        "repeat_stopped": self.repeat_stopped(task)
+                        if callable(self.repeat_stopped) else self.repeat_stopped,
                     }
                 try:
                     on_task_complete(task.task_id, text)
@@ -238,21 +251,23 @@ def extract_scenes(context, monkeypatch):
     generator = FakeGenerator()
     monkeypatch.setattr("extraction.steps.qwen_generator", generator)
     extract_graph_scenes(
-        context, model="qwen3vl", schema="prompts/scene_graph_v9.md", arm="graph_qwen3vl"
+        context, model="qwen3vl_2b", schema="prompts/scene_graph_v9_core.md", arm="graph_qwen3vl_2b"
     )
     return generator
 
 
-def prepare_inputs(context, monkeypatch):
+def prepare_inputs(context, monkeypatch, *, modules=True):
     from extraction.steps import extract_description_scenes
-    from validation.steps import embed_representations
+    from validation.steps import embed_representations, prepare_module
 
     generator = extract_scenes(context, monkeypatch)
     description = FakeGenerator("A person cuts a tomato with a knife in a kitchen.")
     monkeypatch.setattr("extraction.steps.qwen_generator", description)
-    extract_description_scenes(context, model="qwen3vl", schema="prompts/scene_description_v3.md",
-                               arm="desc_qwen3vl")
+    extract_description_scenes(context, model="qwen3vl_2b", schema="prompts/scene_description_dwys.md",
+                               arm="desc_qwen3vl_2b")
     embed_representations(context, target=TARGETS)
+    if modules:
+        prepare_module(context, target=["graph-activity"])
     return generator, description
 
 
@@ -263,27 +278,7 @@ def train_inputs(context, monkeypatch):
     return run_recommendation(context, target=TARGETS)
 
 
-def summary_options(context, catalog=None):
-    return dict(
-        arm=generation_registry(context.config)["graph_qwen3vl"],
-        schema=context.root / "prompts" / "summary_graph_v9.md",
-        catalog=catalog or context.require_ready_cohort()["catalog"],
-        provenance={
-            "uses_title": False,
-            "scene_arm": "graph_qwen3vl",
-            "representation": "graph",
-            "summary_model": "qwen3vl",
-            "model": {"files_signature": "fake"},
-            "prompt_hash": "fake",
-            "settings": {"backend": "vllm", "generation": {"model": "qwen3vl"}},
-        },
-        generation=generation_settings("qwen3vl", representation="graph", summary=True),
-        model="qwen3vl",
-        force=False,
-    )
-
-
-def graph_store(context, *, counts=(2, 1), arm_name="g1"):
+def graph_store(context, *, counts=(2, 1), arm_name="graph-activity"):
     from arm_registry import registry
     from validation.graph_inputs import build_input
 
@@ -300,7 +295,7 @@ def graph_store(context, *, counts=(2, 1), arm_name="g1"):
                 value["actions"][0].update(actor="f1", target="p1", tool=None, place="unknown")
             records.append(scene_row(item["content_id"], index, value=value))
         write_scene_records(
-            context.scene_arm_dir("graph_qwen3vl") / f"{item['content_id']}.jsonl", records
+            context.scene_arm_dir("graph_qwen3vl_2b") / f"{item['content_id']}.jsonl", records
         )
     texts, arrays, stats = build_input(context, cohort, registry(context.config)[arm_name])
     encoder = FakeEncoder()
@@ -341,14 +336,6 @@ def result_identity(context, cohort, seed=42, arm="base"):
     )
 
 
-def refresh_checksums(directory):
-    from validation.shared_cache import checksum
-
-    complete = read_json(directory / "complete.json")
-    complete["checksums"] = {name: checksum(directory / name) for name in complete["checksums"]}
-    write_json(directory / "complete.json", complete)
-
-
 def assert_run_grid(context, *, graph_mode=False):
     from validation.leave_one_out_recommendation import combination_complete
 
@@ -357,8 +344,8 @@ def assert_run_grid(context, *, graph_mode=False):
     for seed in (42, 43, 44):
         for arm in TARGETS:
             directory = context.recommendations_dir / f"seed_{seed}" / arm
-            identity = result_identity(context, cohort, seed, arm)
-            assert combination_complete(directory, identity, 3)
+            assert combination_complete(directory)
+            assert read_json(directory / "complete.json")["identity"] == result_identity(context, cohort, seed, arm)
             training = read_json(directory / "training.json")
             assert training["checkpoint_policy"] == "best_validation_hr10"
             assert len(training["train"]) == 2

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import numpy as np
-from artifact_io import fingerprint
 from pipeline_runtime import RunContext
 from validation.selection import load_validation_cohort
 from validation.representation_provenance import read_state
@@ -10,26 +9,26 @@ from validation.representation_provenance import read_state
 
 def compare_runs(context, reference_run_id, *, target=None):
     from validation.leave_one_out_diagnosis import cluster_bootstrap, collect_metrics
-    from validation.steps import validation_config
+    from validation.config import validation_config
 
     if reference_run_id == context.run_id:
         raise ValueError("comparison requires two different run IDs")
     reference = RunContext.load(reference_run_id, dataset=context.dataset, root=context.root)
+    from copy import deepcopy
     from arm_registry import select_arms
+    from rec_experiments import CONFIG_KEY
+
+    # Use the invocation snapshot; never reload a file changed during training/diagnosis.
+    reference.config[CONFIG_KEY] = deepcopy(context.config[CONFIG_KEY])
 
     names = list(select_arms(context.config, target))
     if not names:
         raise ValueError("run comparison requires at least one target")
     arms = {name: name for name in names}
     cohorts = [load_validation_cohort(ctx) for ctx in (context, reference)]
-    for key in ("protocol", "preprocessing", "source_data_hash"):
-        if cohorts[0]["plan"][key] != cohorts[1]["plan"][key]:
-            raise ValueError(f"run comparison requires identical {key}")
-    for filename in ("events", "catalog"):
-        if fingerprint(cohorts[0][filename]) != fingerprint(cohorts[1][filename]):
-            raise ValueError(f"run comparison requires identical {filename}")
-    if cohorts[0]["plan"]["splits"] != cohorts[1]["plan"]["splits"]:
-        raise ValueError("run comparison requires identical evaluation partitions")
+    # Paired user statistics need the same users, events and partitions in both runs.
+    if cohorts[0]["events"] != cohorts[1]["events"] or cohorts[0]["plan"]["splits"] != cohorts[1]["plan"]["splits"]:
+        raise ValueError("run comparison requires identical cohort events and partitions")
     configs = [validation_config(ctx) for ctx in (context, reference)]
     if sorted(configs[0].model.seeds) != sorted(configs[1].model.seeds):
         raise ValueError("run comparison requires identical model seeds")
@@ -39,11 +38,6 @@ def compare_runs(context, reference_run_id, *, target=None):
     ]
     left, counts, left_report = aggregates[0]
     right, other_counts, right_report = aggregates[1]
-    from validation.recommendation_contracts import EVALUATION_CONTRACT
-
-    if any(report.get("evaluation_contract") != EVALUATION_CONTRACT
-           for report in (left_report, right_report)):
-        raise ValueError("run comparison requires identical current evaluation contracts")
     grids = [
         {(r["split_hash"], r["seed"], r["arm"]) for r in report["per_seed"]}
         for report in (left_report, right_report)

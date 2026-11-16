@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "viewing-context-pipeline"
 version = "0.1.0"
-description = "Visual-only MicroLens graph-versus-description pilot pipeline"
+description = "Viewing-context scene graphs from on-device VLMs for video recommendation (research PoC)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,15 +17,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-qwen = ["torch", "transformers>=5.2.0", "vllm>=0.28.0; sys_platform == 'linux'"]
-minicpm = ["torch", "transformers>=5.18.0", "vllm==0.32.0; sys_platform == 'linux'"]
-train = ["torch"]
-embedding = ["torch", "transformers"]
-gemini = ["google-genai"]
+# Kept in sync with requirements-main.txt / requirements-extra.txt / requirements-dev.txt.
+main = ["torch", "transformers>=5.2.0", "vllm>=0.28.0; sys_platform == 'linux'"]
+extra = ["viewing-context-pipeline[main]", "google-genai"]
 dev = ["pytest", "ruff"]
 
 [tool.setuptools]
-py-modules = ["artifact_io", "pipeline_runtime", "arm_registry", "model_provenance", "pipeline_logging", "visual_sampling"]
+package-dir = {"" = "src"}
+py-modules = ["artifact_io", "pipeline_runtime", "arm_registry", "rec_experiments", "pipeline_logging", "visual_sampling"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -5,20 +5,20 @@ from concurrent.futures import ProcessPoolExecutor
 import json
 import multiprocessing as mp
 from pathlib import Path
-import shutil
 import tempfile
 
 import numpy as np
 
-from arm_registry import RECOMMENDATION_ARM_CONTRACT, feature_source, select_arms
+from arm_registry import feature_source, select_arms
 from artifact_io import fingerprint
+from extraction.graph_warnings import REPEAT_OCCURRED, blocking_tags, warning_tags
 from extraction.structured_output import validate_graph_structure, OutputValidationError
-from extraction.scene_storage import read_scene_records, validate_scene_payload, recover_scene_graph
-from model_provenance import local_model_identity
+from extraction.scene_storage import validate_scene_payload, recover_scene_graph
 from artifact_io import read_json, write_json
-from validation.shared_cache import SharedCache, checksum
+from artifact_io import file_fingerprint as checksum
+from validation.shared_cache import SharedCache
 
-VERSION = "scene-bge-inputs/v1"
+VERSION = "scene-bge-inputs/v4"
 ROLES = ("actor", "target", "tool", "receiver", "place")
 # Keep the receiver tensor slot for model/checkpoint shape compatibility.
 # Current receiver-free input always supplies the absent state.
@@ -40,36 +40,22 @@ ARRAYS = (
 
 
 def source_identity(context, cohort, arm):
-    catalog, metadata = cohort["catalog"], cohort["metadata_titles"]
-    if len(catalog) != len(metadata) or any(
-        str(item["content_id"]) != str(title["content_id"])
-        or str(item["item_id"]) != str(title["item_id"])
-        for item, title in zip(catalog, metadata, strict=True)
-    ):
-        raise ValueError("graph metadata/catalog order mismatch")
+    """Shared-cache key: scene file contents, catalog, titles and encoder settings."""
     sources = []
-    generation_identity = None
     if arm.model:
         directory = context.scene_arm_dir(arm.scene_arm)
-        identity_path = directory / "generation_identity.json"
-        generation_identity = read_json(identity_path) if identity_path.exists() else None
         for item in cohort["catalog"]:
             path = directory / f"{item['content_id']}.jsonl"
-            if path.is_file():
-                read_scene_records(path)
             sources.append([item["content_id"], checksum(path) if path.is_file() else None])
     titles = [r["title"].strip() for r in cohort["metadata_titles"]] if arm.uses_title else []
     return fingerprint(
         {
-            "version": VERSION,
-            "arm_contract": RECOMMENDATION_ARM_CONTRACT,
             "source": arm.scene_arm,
             "files": sources,
-            "generation_identity": generation_identity,
             "catalog": cohort["catalog"],
             "titles": titles,
             "encoder": context.config["validation"]["encoder"],
-            "model": local_model_identity(context.path("models", "bge")),
+            "model": str(context.path("models", "bge")),
         }
     )
 
@@ -94,8 +80,10 @@ def build_input(context, cohort, arm):
                 "valid_scenes",
                 "actionless",
                 "raw",
-                "warning",
-                "failed",
+                "parse_failed",
+                "repeat_occurred",
+                "token_limit",
+                "error",
                 "unsupported_format",
                 "invalid_structure",
                 "missing_file",
@@ -144,12 +132,16 @@ def build_input(context, cohort, arm):
 
             validate_scene_payload(path, row)
             if "error" in row:
-                reject("failed", row["error"])
+                reject("error", row["error"])
                 continue
             expected = "description" if arm.representation == "description" else "scene_graph"
             if expected not in row:
                 raise ValueError(f"scene representation mismatch: expected {expected}: {path}")
             if arm.representation == "description":
+                tags = warning_tags(row.get("warning", []))
+                if tags:
+                    reject(tags[0].lower())
+                    continue
                 data["contexts"].append(text_id(row["description"]))
                 data["scene_keys"].append(json.dumps([str(cid), row["scene_idx"]]))
                 for name, values in (("scene_offsets", "nodes"),
@@ -159,11 +151,14 @@ def build_input(context, cohort, arm):
                 report["valid_scenes"] += 1
                 continue
             g, warnings = recover_scene_graph(row["scene_graph"], row["warning"])
+            # Warned scenes keep their output but never enter BGE or the Graph,
+            # except a usable warning, which is only counted.
+            if blocking_tags(warnings):
+                reject(blocking_tags(warnings)[0].lower())
+                continue
+            report["repeat_occurred"] += REPEAT_OCCURRED in warnings
             if not isinstance(g, dict):
                 reject("raw")
-                continue
-            if warnings:
-                reject("warning", str(warnings))
                 continue
             try:
                 validate_graph_structure(g)
@@ -265,27 +260,8 @@ def encode_texts(settings, texts):
         return np.concatenate([np.load(Path(temp) / f"{i}.npy") for i in range(count)])
 
 
-def bundle_valid(directory, signature, embedding_dim):
-    try:
-        manifest = read_json(directory / "manifest.json")
-        features = np.load(directory / "features.npy", mmap_mode="r", allow_pickle=False)
-        return (
-            manifest["input_hash"] == signature
-            and manifest["version"] == VERSION
-            and manifest.get("arm_contract") == RECOMMENDATION_ARM_CONTRACT
-            and features.shape == (manifest["feature_count"], embedding_dim)
-            and features.dtype == np.float32
-            and set(manifest["checksums"]) == {f"{n}.npy" for n in ARRAYS} | {"statistics.json"}
-            and all(
-                checksum(directory / n) == digest for n, digest in manifest["checksums"].items()
-            )
-        )
-    except (OSError, ValueError, KeyError, TypeError, EOFError):
-        return False
-
-
 def prepare(context, *, target, force=False):
-    from validation.steps import validation_config
+    from validation.config import validation_config
     from validation.selection import prepare_validation_cohort
 
     context.initialize()
@@ -295,22 +271,15 @@ def prepare(context, *, target, force=False):
     arms = select_arms(context.config, target)
     sources = {feature_source(arm): arm for arm in arms.values()}
     for name, arm in sources.items():
-        signature = source_identity(context, cohort, arm)
         destination = context.representations_dir / name
-        cache = SharedCache(context, "scene_inputs", signature)
-        if not force and bundle_valid(destination, signature, settings.embedding_dim):
+        # Resume: an existing manifest means the bundle is done; --force rebuilds it.
+        if not force and (destination / "manifest.json").is_file():
             reused.append(name)
             continue
-        if not force:
-            with tempfile.TemporaryDirectory() as temp:
-                temp = Path(temp)
-                if cache.restore(temp) and bundle_valid(temp, signature, settings.embedding_dim):
-                    destination.mkdir(parents=True, exist_ok=True)
-                    for p in temp.iterdir():
-                        if p.name != "cache.json":
-                            shutil.copy2(p, destination / p.name)
-                    reused.append(name)
-                    continue
+        signature = source_identity(context, cohort, arm)
+        if not force and SharedCache(context, "scene_inputs", signature).restore(destination):
+            reused.append(name)
+            continue
         texts, arrays, stats = build_input(context, cohort, arm)
         pending.append((name, signature, texts, arrays, stats))
     unique = sorted({t for _, _, texts, _, _ in pending for t in texts if t})
@@ -323,9 +292,6 @@ def prepare(context, *, target, force=False):
         raise ValueError("invalid graph BGE features")
     lookup = {t: i for i, t in enumerate(unique)}
     for name, signature, texts, arrays, stats in pending:
-        arm = sources[name]
-        if source_identity(context, cohort, arm) != signature:
-            raise ValueError(f"Graph inputs changed during preparation: {name}; rerun preparation")
         destination = context.representations_dir / name
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "manifest.json").unlink(missing_ok=True)
@@ -347,12 +313,10 @@ def prepare(context, *, target, force=False):
             write_json(temp / "statistics.json", stats)
             manifest = {
                 "version": VERSION,
-                "arm_contract": RECOMMENDATION_ARM_CONTRACT,
                 "input_hash": signature,
                 "source": name,
                 "catalog": cohort["catalog"],
                 "feature_count": len(texts),
-                "checksums": {p.name: checksum(p) for p in temp.iterdir()},
             }
             write_json(temp / "manifest.json", manifest)
             for p in temp.iterdir():
@@ -363,47 +327,27 @@ def prepare(context, *, target, force=False):
             destination,
             [f"{n}.npy" for n in ARRAYS] + ["manifest.json", "statistics.json"],
             origin={"run_id": context.run_id},
-            replace_corrupt=not force,
         )
     return {
         "stage": "embed-representations",
-        "arm_contract": RECOMMENDATION_ARM_CONTRACT,
         "selected_arms": list(arms),
         "generated_sources": [p[0] for p in pending],
         "reused_sources": reused,
     }
 
 
-def verify(context, cohort, arms):
-    selected = select_arms(context.config, list(arms))
-    for name, arm in {feature_source(a): a for a in selected.values()}.items():
-        signature = source_identity(context, cohort, arm)
-        path = context.representations_dir / name
-        if not bundle_valid(path, signature, context.config["validation"]["encoder"]["embedding_dim"]):
-            raise ValueError(
-                f"missing/stale/corrupt graph inputs: {name}; rerun embed-representations"
-            )
-        if read_json(path / "manifest.json")["catalog"] != cohort["catalog"]:
-            raise ValueError("graph catalog mismatch")
-
-
-
-def scene_segments_paths(directory, variant="true"):
-    """(array, metadata) paths of a scene_segments sidecar variant ("true" or "shuffled")."""
-    if variant not in ("true", "shuffled"):
-        raise ValueError("scene segment variant must be true or shuffled")
-    stem = "scene_segments" if variant == "true" else f"scene_segments_{variant}"
+def scene_segments_paths(directory, variant=None):
+    """Activity incidence and metadata paths; a (name, seed) variant sits beside the default sidecar."""
     directory = Path(directory)
+    stem = "scene_segments" if variant is None else f"scene_segments.{variant[0]}-s{variant[1]}"
     return directory / f"{stem}.npy", directory / f"{stem}.json"
 
 
-def write_scene_segments(directory, pairs, statistics=None, variant="true"):
+def write_scene_segments(directory, pairs, statistics=None, variant=None):
     """Attach a scene-segment incidence, [bundle scene row, segment id] pairs, to a valid bundle.
 
     Pairs are stored sorted by scene row; a segment holds >= 1 scenes of one video, each scene at most once.
     """
-    from validation.graph_context import SCENE_SEGMENTS_VERSION
-
     directory = Path(directory)
     array_path, meta_path = scene_segments_paths(directory, variant)
     manifest = read_json(directory / "manifest.json")
@@ -424,40 +368,31 @@ def write_scene_segments(directory, pairs, statistics=None, variant="true"):
         raise ValueError("a segment must stay within one video")
     pairs = pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
     np.save(array_path, pairs)
-    write_json(
-        meta_path,
-        {
-            "version": SCENE_SEGMENTS_VERSION,
-            "variant": variant,
-            "input_hash": manifest["input_hash"],
-            "pairs": int(len(pairs)),
-            "segments": int(len(ids)),
-            "statistics": statistics,
-            "checksum": checksum(array_path),
-        },
-    )
+    meta = {
+        "input_hash": manifest["input_hash"],
+        "pairs": int(len(pairs)),
+        "segments": int(len(ids)),
+        "statistics": statistics,
+    }
+    if variant is not None:
+        meta |= {"variant": variant[0], "seed": variant[1]}
+    write_json(meta_path, meta)
 
 
-def scene_segments_identity(directory, variant="true"):
-    """Validated sidecar metadata; raises if missing, stale or corrupt."""
-    from validation.graph_context import SCENE_SEGMENTS_VERSION
-
+def scene_segments_identity(directory, variant=None):
+    """Sidecar metadata; segments index bundle scene rows, so they must belong to this bundle."""
     directory = Path(directory)
-    array_path, meta_path = scene_segments_paths(directory, variant)
+    _, meta_path = scene_segments_paths(directory, variant)
     if not meta_path.is_file():
-        raise ValueError(f"missing scene segments ({variant}): {directory}; run python -m validation prepare-module")
+        raise ValueError(f"missing scene segments: {meta_path}; run python -m validation prepare-module")
     meta = read_json(meta_path)
-    manifest = read_json(directory / "manifest.json")
-    if (
-        meta.get("version") != SCENE_SEGMENTS_VERSION
-        or meta.get("input_hash") != manifest["input_hash"]
-        or checksum(array_path) != meta.get("checksum")
-    ):
-        raise ValueError(f"stale scene segments ({variant}): {directory}; run python -m validation prepare-module")
+    if meta.get("input_hash") != read_json(directory / "manifest.json")["input_hash"]:
+        raise ValueError(f"scene segments belong to an older bundle: {meta_path}; "
+                         "run python -m validation prepare-module --force")
     return meta
 
 
-def load_scene_segments(directory, variant="true"):
+def load_scene_segments(directory, variant=None):
     """The validated [scene row, segment] pairs of a bundle, sorted by scene row."""
     scene_segments_identity(directory, variant)
     pairs = np.load(scene_segments_paths(directory, variant)[0], allow_pickle=False)

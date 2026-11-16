@@ -1,5 +1,11 @@
 """Streaming generation and failure-only passes without generation journals."""
 
+from contextlib import contextmanager, ExitStack
+from pathlib import Path
+from typing import Callable, Iterator
+
+from extraction.backends.qwen_workers import QwenWorkerPool
+
 
 def generate_once(generate, tasks, complete):
     admitted, completed = set(), set()
@@ -28,7 +34,8 @@ def generate_once(generate, tasks, complete):
 def generate_penalty_passes(generate, tasks, penalties, complete, log=None, on_pass=None):
     """Finish each pass before retrying failures; keep only pending tasks in memory.
 
-    complete(task_id, text, final=...) publishes the outcome and returns failure.
+    complete(task_id, text, final=...) publishes the outcome and returns whether to retry
+    (anything but success, REPEAT_OCCURRED included).
     """
     from dataclasses import replace
     from extraction.qwen_config import penalty_schedule
@@ -57,3 +64,48 @@ def generate_penalty_passes(generate, tasks, penalties, complete, log=None, on_p
         if not retry:
             break
         tasks = retry
+
+
+@contextmanager
+def qwen_generator(
+    *, model_path: Path, settings=None, image_limit=6, runtime=None, log=None, on_progress=None
+) -> Iterator[Callable]:
+
+    def ready(event):
+        if runtime:
+            runtime.engine_ready(event)
+        if log:
+            log(
+                f"[vLLM] GPU {event['gpu_id']} ready | {event.get('model_family', 'Qwen')} | {event['gpu_name']} | settings={event['settings']}"
+            )
+
+    with ExitStack() as resources:
+        pool = None
+
+        def generate(tasks, on_task_complete=None):
+            nonlocal pool
+            if pool is None:
+                if log:
+                    log("[vLLM] starting GPU workers")
+                pool = resources.enter_context(
+                    QwenWorkerPool(
+                        str(model_path),
+                        settings=settings,
+                        image_limit=image_limit,
+                        on_runtime=ready,
+                        on_progress=on_progress,
+                    )
+                )
+
+            def complete(task_id, text):
+                if runtime:
+                    runtime.current_result = pool.last_result
+                try:
+                    on_task_complete(task_id, text)
+                finally:
+                    if runtime:
+                        runtime.current_result = None
+
+            return pool.generate(tasks, complete if on_task_complete else None)
+
+        yield generate

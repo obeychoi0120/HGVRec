@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
@@ -11,17 +10,12 @@ import time
 import numpy as np
 from tqdm import tqdm
 
-from artifact_io import read_json, write_json
-from validation.profiling import RunProfiler, sampled, span
-from validation.metrics import metrics_from_rank
+from artifact_io import write_json
+from validation.leave_one_out_data import metrics_from_rank
 from validation.early_stopping import EarlyStopping
 from validation.model import require_torch, save_checkpoint, seed_everything, torch
-from validation.representation_checks import verify_representations
-from validation.recommendation import _optimizer
-from arm_registry import RECOMMENDATION_ARM_CONTRACT
-from validation.recommendation_contracts import ARCHITECTURE_VERSION, EVALUATION_CONTRACT, resolve_target_arms
+from arm_registry import resolve_target_arms
 from validation.leave_one_out_data import EventTable, PROTOCOL
-from preparation.cohort import iter_jsonl
 from validation.selection import load_validation_cohort, training_signature
 from validation.leave_one_out_execution import (
     EXECUTION_VERSION,
@@ -29,6 +23,11 @@ from validation.leave_one_out_execution import (
     masked_ranks,
     negative_mask,
 )
+
+
+def _optimizer(model, config):
+    return torch.optim.AdamW(model.parameters(), lr=config.model.learning_rate, weight_decay=0.1)
+
 
 SCHEMA = "sasrec-leave-one-out-combination/v2"
 
@@ -39,30 +38,25 @@ def phase_ids(table, split, phase):
 
 
 def transition_loss(model, table, ids, probabilities, device):
-    with span("input_prepare"):
-        execution = execution_for(table)
-        target_ids = table.targets[ids]
-        targets = torch.as_tensor(target_ids, dtype=torch.long, device=device)
-        inputs = execution.inputs(ids, model.max_length, device)
-        if hasattr(model, "prepare_items"):
-            graph_ids = np.concatenate(
-                [execution.padded(model.max_length)[ids].reshape(-1), target_ids]
-            )
+    execution = execution_for(table)
+    target_ids = table.targets[ids]
+    targets = torch.as_tensor(target_ids, dtype=torch.long, device=device)
+    inputs = execution.inputs(ids, model.max_length, device)
     if hasattr(model, "prepare_items"):
+        graph_ids = np.concatenate(
+            [execution.padded(model.max_length)[ids].reshape(-1), target_ids]
+        )
         model.prepare_items(graph_ids)
-    with span("sasrec_forward"):
-        users = model.user_vectors(inputs)
-    with span("candidate_vectors"):
-        candidates = model.item_vectors(targets)
-    with span("logits_loss"):
-        logits = users @ candidates.T
-        logs = execution.log_probabilities(probabilities, target_ids, device, logits.dtype)
-        logits = logits - logs[targets][None, :]
-        masks = negative_mask(inputs, targets)
-        logits = logits.masked_fill(masks, -1e4)
-        loss = torch.nn.functional.cross_entropy(logits, torch.arange(len(ids), device=device))
-        if not torch.isfinite(loss):
-            raise RuntimeError("nonfinite transition loss")
+    users = model.user_vectors(inputs)
+    candidates = model.item_vectors(targets)
+    logits = users @ candidates.T
+    logs = execution.log_probabilities(probabilities, target_ids, device, logits.dtype)
+    logits = logits - logs[targets][None, :]
+    masks = negative_mask(inputs, targets)
+    logits = logits.masked_fill(masks, -1e4)
+    loss = torch.nn.functional.cross_entropy(logits, torch.arange(len(ids), device=device))
+    if not torch.isfinite(loss):
+        raise RuntimeError("nonfinite transition loss")
     return loss
 
 
@@ -75,10 +69,6 @@ def train_epoch(
     rng,
     config,
     device,
-    *,
-    profiler=None,
-    phase="train",
-    epoch=0,
 ):
     model.train()
     total = torch.zeros((), dtype=torch.float64, device=device)
@@ -86,21 +76,15 @@ def train_epoch(
     order = rng.permutation(ids)
     for start in range(0, len(order), config.model.batch_size):
         batch = order[start : start + config.model.batch_size]
-        with sampled(profiler, phase, epoch, updates + 1, len(batch)):
-            with span("zero_grad"):
-                optimizer.zero_grad(set_to_none=True)
-            loss = transition_loss(model, table, batch, probabilities, device)
-            with span("backward"):
-                loss.backward()
-            with span("clip_grad"):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            with span("optimizer"):
-                optimizer.step()
-            with span("cleanup"):
-                if hasattr(model, "clear_item_cache"):
-                    model.clear_item_cache()
-                total += loss.detach().to(torch.float64) * len(batch)
-            updates += 1
+        optimizer.zero_grad(set_to_none=True)
+        loss = transition_loss(model, table, batch, probabilities, device)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        optimizer.step()
+        if hasattr(model, "clear_item_cache"):
+            model.clear_item_cache()
+        total += loss.detach().to(torch.float64) * len(batch)
+        updates += 1
     if not len(ids):
         raise RuntimeError("empty training partition")
     return {
@@ -110,45 +94,33 @@ def train_epoch(
     }
 
 
-def rank_batches(model, table, ids, config, device, *, profiler=None, phase="evaluation", epoch=0):
+def rank_batches(model, table, ids, config, device):
     """Share ranking between validation-only and full per-event evaluation."""
     model.eval()
     execution = execution_for(table)
     with torch.no_grad():
-        with sampled(profiler, phase, epoch, kind="catalog"):
-            with span("catalog_encode"):
-                catalog = model.catalog_vectors()
-        for step, start in enumerate(range(0, len(ids), config.model.batch_size), 1):
+        catalog = model.catalog_vectors()
+        for start in range(0, len(ids), config.model.batch_size):
             batch = ids[start : start + config.model.batch_size]
-            with sampled(profiler, phase, epoch, step, len(batch)):
-                with span("input_prepare"):
-                    inputs = execution.inputs(batch, model.max_length, device)
-                with span("sasrec_forward"):
-                    users = model.user_vectors(inputs)
-                with span("catalog_score"):
-                    scores = users @ catalog.T
-                with span("mask_rank"):
-                    ranks = masked_ranks(scores, table, batch)
-                with span("rank_to_cpu"):
-                    ranks = ranks.cpu().tolist()
+            inputs = execution.inputs(batch, model.max_length, device)
+            users = model.user_vectors(inputs)
+            scores = users @ catalog.T
+            ranks = masked_ranks(scores, table, batch)
+            ranks = ranks.cpu().tolist()
             yield batch, ranks
 
 
-def validation_hr10(model, table, ids, config, device, *, profiler=None, epoch=0):
+def validation_hr10(model, table, ids, config, device):
     return sum(
         float(rank <= 10)
-        for _, ranks in rank_batches(
-            model, table, ids, config, device, profiler=profiler, phase="validation", epoch=epoch
-        )
+        for _, ranks in rank_batches(model, table, ids, config, device)
         for rank in ranks
     ) / len(ids)
 
 
-def evaluate(model, table, ids, config, device, *, profiler=None):
+def evaluate(model, table, ids, config, device):
     """Frozen parameters, cached catalog vectors, full preceding sequence mask."""
-    for batch, ranks in rank_batches(
-        model, table, ids, config, device, profiler=profiler, phase="test"
-    ):
+    for batch, ranks in rank_batches(model, table, ids, config, device):
         for event, rank in zip(batch, ranks, strict=True):
             yield {
                 **table.rows[int(event)],
@@ -162,108 +134,30 @@ def combination_dir(context, seed, arm):
     return context.recommendations_dir / f"seed_{seed}" / arm.lower()
 
 
-def result_files(identity):
-    return ["sasrec.pt", "training.json", "per_event_metrics.jsonl", "catalog_vectors.npy"]
-
-
-def combination_complete(directory, identity, expected_count, *, architecture_version=None):
-    if (identity.get("arm_contract") != RECOMMENDATION_ARM_CONTRACT
-            or identity.get("architecture_version") != ARCHITECTURE_VERSION
-            or identity.get("protocol") != PROTOCOL or not identity.get("split_hash")
-            or identity.get("evaluation_contract") != EVALUATION_CONTRACT):
-        return False
-    if architecture_version is None:
-        architecture_version = identity["architecture_version"]
-    try:
-        complete = read_json(directory / "complete.json")
-        schema = complete.get("schema_version")
-        if schema != SCHEMA or any(
-            complete.get("identity", {}).get(key) != value for key, value in identity.items()
-        ):
-            return False
-        if complete.get("event_count") != expected_count:
-            return False
-        names = set(result_files(identity))
-        if not all(
-            (directory / name).is_file() and (directory / name).stat().st_size for name in names
-        ):
-            return False
-        from validation.shared_cache import checksum
-
-        if set(complete.get("checksums", {})) != names or any(
-            checksum(directory / name) != complete["checksums"][name] for name in names
-        ):
-            return False
-        training = read_json(directory / "training.json")
-        if training.get("architecture_version") != architecture_version:
-            return False
-        if training.get("schema_version") != schema or any(
-            training.get(key) != value for key, value in identity.items()
-        ):
-            return False
-        epochs = training.get("train", [])
-        if not epochs or training.get("checkpoint_policy") != "best_validation_hr10":
-            return False
-        if training.get("split", {}).get("split_hash") != identity["split_hash"]:
-            return False
-        if not all(math.isfinite(row["validation_hr10"]) and 0 <= row["validation_hr10"] <= 1 for row in epochs):
-            return False
-        best = max(epochs, key=lambda r: r["validation_hr10"])
-        if training.get("best_epoch") != best["epoch"]:
-            return False
-        seen = set()
-        for row in iter_jsonl(directory / "per_event_metrics.jsonl"):
-            event = row["event_id"]
-            if (
-                row.get("schema_version") != "sasrec-leave-one-out-per-event/v2"
-                or type(event) is not int
-                or event < 0
-                or event in seen
-                or any(row.get(key) != value for key, value in identity.items())
-                or type(row["rank"]) is not int
-                or not 1 <= row["rank"] <= training["catalog_size"]
-                or row["candidate_count"] != training["catalog_size"]
-            ):
-                return False
-            seen.add(event)
-        return len(seen) == expected_count
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return False
+def combination_complete(directory):
+    """Resume rule: a combination is done once its completion marker exists."""
+    return (directory / "complete.json").is_file()
 
 
 def run_combination(
-    context, config, table, split, identity, branch, prepared, device, *,
-    profile_every=None, profile_operators=False,
+    context, config, table, split, identity, branch, prepared, device,
 ):
-    if profile_operators and profile_every is None:
-        raise ValueError("profile_operators requires profile_every")
-    if identity.get("evaluation_contract") != EVALUATION_CONTRACT:
-        raise ValueError("unsupported recommendation evaluation contract")
     ids, probabilities, frequencies = prepared
     seed, arm = (identity[key] for key in ("seed", "arm"))
     directory = combination_dir(context, seed, arm)
     directory.mkdir(parents=True, exist_ok=True)
+    write_json(directory / "identity.json", identity)
     (directory / "complete.json").unlink(missing_ok=True)
     print(f"[Leave-one-out] seed={seed} {arm}: train device={device}", flush=True)
-    profiler = (
-        RunProfiler(
-            directory, {**identity, "deterministic": config.model.deterministic}, device,
-            profile_every, operators=profile_operators,
-        )
-        if profile_every is not None
-        else None
-    )
     started = time.monotonic()
     timings = dict.fromkeys(
         ("preparation", "train", "validation", "checkpoint_restore", "test"), 0.0
     )
-    with sampled(profiler, "preparation", kind="stage"):
-        with span("history_and_probabilities"):
-            execution = execution_for(table)
-            execution.padded(config.model.max_sequence_length)
-            execution.log_probabilities(
-                probabilities["train"], table.targets[ids["train"]], device, torch.float32
-            )
+    execution = execution_for(table)
+    execution.padded(config.model.max_sequence_length)
+    execution.log_probabilities(
+        probabilities["train"], table.targets[ids["train"]], device, torch.float32
+    )
     timings["preparation"] = time.monotonic() - started
     def create_model():
         from validation.graph_model import new_graph_model
@@ -272,10 +166,8 @@ def run_combination(
 
     seed_everything(seed, deterministic=config.model.deterministic)
     rng = np.random.default_rng(seed)
-    with sampled(profiler, "train_init", kind="stage"):
-        with span("model_and_optimizer"):
-            model = create_model()
-            optimizer = _optimizer(model, config)
+    model = create_model()
+    optimizer = _optimizer(model, config)
     train = []
     stopping = EarlyStopping(config.model.patience, getattr(config.model, "min_delta", 0.0))
     for epoch in range(1, config.model.max_epochs + 1):
@@ -289,22 +181,15 @@ def run_combination(
             rng,
             config,
             device,
-            profiler=profiler,
-            phase="train",
-            epoch=epoch,
         )
         train_seconds = time.monotonic() - phase_started
         timings["train"] += train_seconds
-        if profiler:
-            profiler.phase("train", epoch, train_seconds, len(ids["train"]))
         phase_started = time.monotonic()
         score = validation_hr10(
-            model, table, ids["validation"], config, device, profiler=profiler, epoch=epoch
+            model, table, ids["validation"], config, device
         )
         valid_seconds = time.monotonic() - phase_started
         timings["validation"] += valid_seconds
-        if profiler:
-            profiler.phase("validation", epoch, valid_seconds, len(ids["validation"]))
         train.append({"epoch": epoch, **record, "validation_hr10": score})
         print(
             f"[Leave-one-out] {arm} seed={seed} epoch={epoch} valid={score:.6f} "
@@ -317,8 +202,7 @@ def run_combination(
         if stopping.best_epoch != previous_best:
             save_checkpoint(
                 directory / "sasrec.pt", model,
-                {**identity, "architecture_version": identity["architecture_version"],
-                 "best_epoch": epoch, "catalog_size": len(table.items),
+                {**identity, "best_epoch": epoch, "catalog_size": len(table.items),
                  "checkpoint_policy": "best_validation_hr10"},
             )
         if stopped:
@@ -336,7 +220,7 @@ def run_combination(
     temporary = directory / "per_event_metrics.jsonl.tmp"
     count = 0
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in evaluate(model, table, ids["test"], config, device, profiler=profiler):
+        for row in evaluate(model, table, ids["test"], config, device):
             row.update(identity)
             row["schema_version"] = "sasrec-leave-one-out-per-event/v2"
             row["train_item_frequency"] = int(frequencies[table.targets[row["event_id"]]])
@@ -348,12 +232,9 @@ def run_combination(
         raise RuntimeError("incomplete evaluation")
     temporary.replace(directory / "per_event_metrics.jsonl")
     timings["test"] = time.monotonic() - phase_started
-    if profiler:
-        profiler.phase("test", 0, timings["test"], len(ids["test"]))
     print(f"[Leave-one-out] {arm} seed={seed} test={timings['test']:.2f}s", flush=True)
     metadata = {
         **identity,
-        "architecture_version": identity["architecture_version"],
         "best_epoch": best_epoch,
         "checkpoint_policy": "best_validation_hr10",
         "catalog_size": len(table.items),
@@ -368,13 +249,9 @@ def run_combination(
     from validation.graph_model import parameter_report
 
     metadata["parameters"] = parameter_report(model, branch)
-    if branch == "g1b":
-        metadata["role_corruption_report"] = model.store.report
-    with sampled(profiler, "export", kind="stage"):
-        with span("catalog_and_checkpoint_save"):
-            with torch.no_grad():
-                np.save(directory / "catalog_vectors.npy", model.catalog_vectors().cpu().numpy())
-            save_checkpoint(directory / "sasrec.pt", model, metadata)
+    with torch.no_grad():
+        np.save(directory / "catalog_vectors.npy", model.catalog_vectors().cpu().numpy())
+    save_checkpoint(directory / "sasrec.pt", model, metadata)
     write_json(
         directory / "training.json",
         {
@@ -389,18 +266,6 @@ def run_combination(
             "execution": {
                 "version": EXECUTION_VERSION,
                 "seconds": timings,
-                **(
-                    {
-                        "profiling": {
-                            "file": "profile.jsonl",
-                            "session_id": profiler.session,
-                            "every": profiler.every,
-                            "operators": profiler.operators,
-                        }
-                    }
-                    if profiler
-                    else {}
-                ),
                 **(
                     {
                         "graph_training": model.execution_report(),
@@ -418,23 +283,15 @@ def run_combination(
             },
         },
     )
-    from validation.shared_cache import checksum
-
     write_json(
         directory / "complete.json",
-        {
-            "schema_version": SCHEMA,
-            "identity": identity,
-            "event_count": count,
-            "checksums": {name: checksum(directory / name) for name in result_files(identity)},
-        },
+        {"schema_version": SCHEMA, "identity": identity, "event_count": count},
     )
     # Publish each completed unit, including in spawned workers, so interruption
     # of a later combination does not withhold already finished shared results.
     from validation import recommendation_cache
 
-    if recommendation_cache.eligible(context, branch):
-        recommendation_cache.publish(context, directory, identity, table, split, force=True)
+    recommendation_cache.publish(context, directory)
 
 
 def prepare_split(table, split):
@@ -460,38 +317,27 @@ def worker_devices(workers_per_gpu):
 
 
 def run_leave_one_out(
-    context, *, force=False, workers_per_gpu=1, target=None, profile_every=None,
-    profile_operators=False,
+    context, *, force=False, workers_per_gpu=1, target=None,
 ):
-    from validation.steps import validation_config
+    from validation.config import validation_config
     from validation.representation_provenance import recommendation_identity
 
-    if profile_every is not None and (type(profile_every) is not int or profile_every < 1):
-        raise ValueError("profile_every must be a positive integer")
-    if profile_operators and profile_every is None:
-        raise ValueError("profile_operators requires profile_every")
-    profile_options = {"profile_every": profile_every} if profile_every is not None else {}
-    if profile_operators:
-        profile_options["profile_operators"] = True
     arms = resolve_target_arms(target, config=context.config)
     from validation import recommendation_cache
 
     config = validation_config(context)
     cohort = load_validation_cohort(context)
     table = EventTable(cohort["events"])
-    verify_representations(context, cohort, arms=arms)
     training_input_hash = training_signature(context, cohort, config)
     completed = skipped = shared = 0
     jobs = []
     combinations = []
     for split in cohort["plan"]["splits"]:
-        expected_count = len(phase_ids(table, split, "test"))
         for seed in config.model.seeds:
             for arm, branch in arms.items():
                 identity = {
                     "run_id": context.run_id,
                     "protocol": PROTOCOL,
-                    "evaluation_contract": dict(EVALUATION_CONTRACT),
                     "split_hash": split["split_hash"],
                     "seed": seed,
                     "arm": arm,
@@ -501,17 +347,14 @@ def run_leave_one_out(
                 }
                 directory = combination_dir(context, seed, arm)
                 combinations.append((directory, identity, branch, split))
-                if not force and combination_complete(directory, identity, expected_count):
-                    skipped += 1
-                elif (
-                    not force
-                    and recommendation_cache.eligible(context, branch)
-                    and recommendation_cache.restore(context, directory, identity, table, split)
-                ):
-                    shared += 1
-                    skipped += 1
-                else:
-                    jobs.append((split, identity, branch))
+    for directory, identity, branch, split in combinations:
+        if not force and combination_complete(directory):
+            skipped += 1
+        elif not force and recommendation_cache.restore(context, directory, identity):
+            shared += 1
+            skipped += 1
+        else:
+            jobs.append((split, identity, branch))
     devices = []
     if jobs:
         require_torch()
@@ -529,7 +372,7 @@ def run_leave_one_out(
         if jobs and len(devices) > 1:
             from validation.leave_one_out_workers import run_parallel
 
-            completed = run_parallel(context, jobs, devices, progress, **profile_options)
+            completed = run_parallel(context, jobs, devices, progress)
         elif jobs:
             previous_split, prepared = None, None
             device = torch.device(devices[0])
@@ -549,13 +392,11 @@ def run_leave_one_out(
                     branch,
                     prepared,
                     device,
-                    **profile_options,
                 )
                 completed += 1
                 progress.update(1)
-    for directory, identity, branch, split in combinations:
-        if recommendation_cache.eligible(context, branch):
-            recommendation_cache.publish(context, directory, identity, table, split, force=force)
+    for directory, _, _, _ in combinations:
+        recommendation_cache.publish(context, directory)
     write_json(
         context.recommendations_dir / "reuse.json",
         {

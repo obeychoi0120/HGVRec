@@ -30,8 +30,8 @@ class QwenGenerationTask:
     structured_output: dict | None = None
     min_p: float = 0.0
     presence_penalty: float = 0.0
-    enable_thinking: bool | None = None
     model: str | None = None
+    stop_repeated_lines: bool = False
 
 
 def _start_worker(context, worker_index, gpu_id, model_path, result_queue, settings, image_limit):
@@ -290,7 +290,7 @@ def _visible_gpu_ids():
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("Qwen requires the 'qwen' optional dependencies") from exc
+        raise RuntimeError("Qwen requires torch and vLLM; pip install -r requirements-main.txt") from exc
     available = int(torch.cuda.device_count())
     if available <= 0:
         raise RuntimeError(
@@ -334,6 +334,7 @@ async def _serve_worker(backend, task_queue, result_queue, worker_index, gpu_id,
                 "output_tokens": output.output_tokens,
                 "finish_reason": getattr(output, "finish_reason", None),
                 "stop_reason": getattr(output, "stop_reason", None),
+                "repeat_stopped": bool(getattr(output, "repeat_stopped", False)),
                 "generation": {
                     key: value
                     for key, value in asdict(task).items()
@@ -389,13 +390,7 @@ def _worker_main(
 
     async def run():
         from extraction.backends.qwen import QwenBackend
-        from extraction.backends.minicpm import MiniCPMBackend
-        from pathlib import Path
-        import json
-
-        config = json.loads((Path(model_path) / "config.json").read_text())
-        backend_type = MiniCPMBackend if config.get("model_type") == "minicpmv4_7" else QwenBackend
-        backend = backend_type.from_pretrained(
+        backend = QwenBackend.from_pretrained(
             model_path, settings=settings, image_limit=image_limit
         )
         try:

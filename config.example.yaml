@@ -1,0 +1,100 @@
+# Pipeline settings template. Copy and fill in the paths for your machine:
+#   cp config.example.yaml config.yaml
+# Relative paths are resolved from the repository root. Values below are the main-experiment defaults.
+# Unknown keys are allowed; everything under `validation` falls back to defaults when omitted
+# (see src/validation/config.py).
+
+artifacts_root: artifacts            # all outputs: preparation/, runs/, shared_cache/
+
+datasets:                            # only the dataset you pass with --dataset needs real files
+  microlens_100k:
+    data:
+      pairs_csv: /path/to/microlens_100k/MicroLens-100k_pairs.csv          # user,item,timestamp(ms)
+      videos_dir: /path/to/microlens_100k/MicroLens-100k_videos            # {item_id}.mp4
+      titles_csv: /path/to/microlens_100k/MicroLens-100k_title_en.csv      # item,title
+      titles_supplement_csv: /path/to/microlens_100k/MicroLens-50k_titles.csv  # optional
+  m3l_10m:
+    data:
+      root: /path/to/m3l-10m         # metadata/{ratings.dat,movies.dat,id_mmrec_to_grouplens.tsv}, videos/
+    source_counts:                   # optional; only sizes the rating progress bar
+      interaction_count: 9409884
+
+models:                              # local checkpoints; keep only the ones you use (bge is always needed)
+  qwen3vl_2b: /path/to/models/Qwen3-VL-2B-Instruct
+  qwen3vl_4b: /path/to/models/Qwen3-VL-4B-Instruct
+  qwen3vl_8b: /path/to/models/Qwen3-VL-8B-Instruct
+  bge: /path/to/models/bge-large-en-v1.5
+  gemini:                            # additional experiments only (Vertex AI via ADC)
+    project_id: <your-gcp-project>
+    location: global
+    model_id: gemini-3.8-flash
+    temperature: 0.0
+    thinking_level: low              # low | medium | high
+    media_resolution: MEDIA_RESOLUTION_LOW
+
+extraction:
+  gemini:
+    threads: 128                     # concurrent Gemini requests
+  qwen:                              # passed to vLLM AsyncEngineArgs; one engine per visible GPU
+    gpu_memory_utilization: 0.95
+    max_num_seqs: 32
+    max_num_batched_tokens: 16384
+    max_model_len: auto
+    renderer_num_workers: 8
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    enforce_eager: false
+    async_scheduling: null
+  visual_evidence:                   # required
+    image_resolution: [640, 352]     # keyframe width, height
+    scene_duration: 30               # seconds per scene window
+    num_keyframes: 6                 # keyframes per scene window
+  description:                       # output token limit per scene, per model
+    qwen3vl_2b: {scene_max_new_tokens: 448}
+    qwen3vl_4b: {scene_max_new_tokens: 448}
+    qwen3vl_8b: {scene_max_new_tokens: 448}
+    gemini: {scene_max_new_tokens: 1024}
+  graph:
+    qwen3vl_2b: {scene_max_new_tokens: 512}
+    qwen3vl_4b: {scene_max_new_tokens: 512}
+    qwen3vl_8b: {scene_max_new_tokens: 512}
+    gemini: {scene_max_new_tokens: 1024}
+
+validation:
+  cohort:
+    metadata_missing_policy: zero_vector
+    min_user_interactions: 5         # users with fewer events are dropped
+    retained_sequence_length: 13     # most recent events kept per user (last 2 = validation/test)
+  encoder:                           # frozen BGE text features
+    embedding_dim: 1024
+    max_length: 512
+    batch_size: 32
+  graph_execution:                   # memory/speed only; does not change the model
+    chunk_items: 256
+    chunk_nodes: 32768
+    chunk_scene_pairs: 1048576
+    checkpoint: auto                 # auto | always | never (activation checkpointing)
+    feature_cache_mb: 2048
+  model:                             # SASRec and training
+    deterministic: true
+    max_sequence_length: 10
+    embedding_dim: 512
+    num_blocks: 2
+    num_heads: 2
+    dropout: 0.1
+    batch_size: 128
+    max_epochs: 50
+    patience: 5
+    min_delta: 0
+    learning_rate: 0.0001
+    popularity_power: 1.0
+    seeds: [42, 43, 44]
+  evaluation:
+    checkpoint_metric: HR@10
+    cutoffs: [4, 8, 10, 20, 30]
+    primary_cutoff: 10
+    bootstrap_samples: 10000
+    familywise_alpha: 0.05
+    multiple_comparison_correction: bonferroni
+    min_scene_coverage: 0.95
+    max_arm_coverage_gap: 0.05

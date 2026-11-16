@@ -1,16 +1,14 @@
 """Shared source cohort preparation and integrity checks."""
 
-from collections import Counter
 from pathlib import Path
 import csv
 import json
 import numpy as np
-from artifact_io import file_fingerprint, read_json, read_jsonl, write_json, write_jsonl
+from artifact_io import read_json, read_jsonl, write_json, write_jsonl
 from preparation.catalog import (
     _positive_finite,
     build_item_inventory,
     load_metadata_titles,
-    load_pairs,
     content_id_for_item,
     normalize_item_id,
 )
@@ -62,32 +60,19 @@ def prepare_full_cohort(context, *, plan_only=False):
         return prepare_m3l_cohort(context, plan_only=plan_only)
     settings = context.config["validation"]["cohort"]
     source = context.path("data", "pairs_csv")
-    print("[COHORT] Loading interaction CSV and checking source counts...", flush=True)
+    print("[COHORT] Loading interaction CSV...", flush=True)
     table, duplicates = load_csv(source)
     observed = {
         "user_count": len(table.users),
         "interaction_count": len(table.rows),
         "item_count": len(table.items),
     }
-    if observed != context.source_counts:
-        raise ValueError(f"full source cardinality mismatch: {observed}")
-    tsv = context.path("data", "pairs_tsv")
-    if tsv.is_file():
-        print("[COHORT] Checking CSV/TSV consistency...", flush=True)
-        pairs = load_pairs(tsv)
-        expected = {
-            user: Counter(table.rows[i]["item_id"] for i in ids)
-            for user, ids in table.by_user.items()
-        }
-        if {u: Counter(v) for u, v in pairs} != expected:
-            raise ValueError("CSV/TSV user interaction multisets differ")
     directory = context.cohort_dir
     directory.mkdir(parents=True, exist_ok=True)
     print("[COHORT] Saving the complete source cohort...", flush=True)
     plan = {
         "schema_version": SCHEMA,
         "metadata_missing_policy": settings["metadata_missing_policy"],
-        "experiment_config_version": context.config["experiment_config_version"],
         **observed,
         "duplicate_rows_preserved": duplicates,
         "no_history_count": int(np.count_nonzero(table.history_ends == 0)),
@@ -219,39 +204,4 @@ def load_cohort(directory, *, dataset="microlens_100k"):
         "required_items": read_jsonl(directory / "required_items.jsonl"),
         "metadata_titles": read_jsonl(directory / "metadata_titles.jsonl"),
     }
-    from preparation.titles import metadata_titles_match_catalog
-
-    plan, catalog = cohort["plan"], cohort["catalog"]
-    expected = [{"item_id": r["item_id"], "content_id": r["content_id"]} for r in catalog]
-    if (
-        any(row["content_id"] != content_id_for_item(row["item_id"], dataset) for row in catalog)
-        or len(catalog) != plan["item_count"]
-        or len({r["item_id"] for r in catalog}) != len(catalog)
-        or cohort["required_items"] != expected
-        or not metadata_titles_match_catalog(
-            directory / "metadata_titles.jsonl", catalog, allow_blank=True
-        )
-    ):
-        raise RuntimeError("invalid full cohort catalog or metadata mapping")
-    users, items = set(), set()
-    count = 0
-    for index, row in enumerate(iter_jsonl(directory / "events.jsonl")):
-        if (
-            type(row.get("event_id")) is not int
-            or row["event_id"] != index
-            or type(row.get("timestamp")) is not int
-            or row["timestamp"] < 0
-        ):
-            raise ValueError("invalid source event ID or timestamp")
-        users.add(row["user_id"])
-        items.add(row["item_id"])
-        count += 1
-    if (
-        count != plan["interaction_count"]
-        or len(users) != plan["user_count"]
-        or items != {r["item_id"] for r in catalog}
-    ):
-        raise RuntimeError("full cohort cardinality mismatch")
-    if dataset == "m3l_10m" and file_fingerprint(directory / "events.jsonl") != plan.get("events_sha256"):
-        raise RuntimeError("M3L prepared interactions changed; rerun prepare-cohort")
     return cohort

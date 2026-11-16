@@ -138,5 +138,5 @@ def _google_genai() -> tuple[Any, Any]:
         from google import genai
         from google.genai import types
     except ImportError as exc:
-        raise RuntimeError("Gemini extraction requires the 'gemini' optional dependencies") from exc
+        raise RuntimeError("Gemini extraction requires google-genai; pip install -r requirements-extra.txt") from exc
     return genai, types

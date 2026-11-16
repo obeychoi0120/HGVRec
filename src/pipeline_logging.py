@@ -14,29 +14,23 @@ def step_settings(context, step, **options):
         "config_file": context.root / CONFIG_PATH,
         "force": options.get("force", False),
     }
-    if step.startswith(("extract-", "summarize-")):
-        summary = step.startswith("summarize-")
+    if step.startswith("extract-"):
         kind = "graph" if "graph" in step else "description"
-        source = options.get("source" if summary else "model")
+        source = options.get("model")
         arm = (
-            generation_registry(context.config)[options["arm"]]
+            generation_registry()[options["arm"]]
             if options.get("arm")
-            else generated_arm(context.config, kind, source)
+            else generated_arm(kind, source)
         )
         source = arm.model
-        phase = "summaries" if summary else "scenes"
         values.update(
             arm=arm.name,
-            model=options["model"] if summary else source,
-            model_settings=context.config["models"][options["model"] if summary else source],
+            model=source,
+            model_settings=context.config["models"][source],
             source=source,
             prompt=context.prompt_path(options["schema"]),
-            output_dir=context.summary_arm_dir(arm.name)
-            if summary
-            else context.extraction_dir(arm.representation, source, phase),
-            max_new_tokens=context.config["extraction"][kind][
-                options["model"] if summary else source
-            ]["summary_max_new_tokens" if summary else "scene_max_new_tokens"],
+            output_dir=context.extraction_dir(arm.representation, source, "scenes"),
+            max_new_tokens=context.config["extraction"][kind][source]["scene_max_new_tokens"],
         )
     else:
         values["output_dir"] = {
@@ -48,7 +42,12 @@ def step_settings(context, step, **options):
             "run-diagnosis": context.diagnosis_dir,
         }[step]
         if step in {"embed-representations", "prepare-module", "run-recommendation", "run-diagnosis"}:
-            values["selected_arms"] = list(select_arms(context.config, options.get("target")))
+            from rec_experiments import CONFIG_PATH as REC_CONFIG_PATH, display_definition, experiment_definition
+
+            arms = select_arms(context.config, options.get("target"))
+            values["selected_arms"] = list(arms)
+            values["rec_experiments_config"] = context.root / REC_CONFIG_PATH
+            values["experiments"] = [display_definition(experiment_definition(arm)) for arm in arms.values()]
     values.update({key: value for key, value in options.items() if key not in values})
     return values
 

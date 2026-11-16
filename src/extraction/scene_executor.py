@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from itertools import chain
-from artifact_io import atomic_write_jsonl, read_jsonl
 
-from extraction.token_usage import qwen_output_tokens, gemini_output_tokens
-
-from extraction.descriptions import SCENE_SCHEMA_VERSION
+from extraction.scene_storage import gemini_output_tokens, qwen_output_tokens
+from extraction.graph_warnings import REPEAT_OCCURRED, TOKEN_LIMIT, USABLE_OUTCOMES, outcome
 from extraction.semantic_graph import parse_or_repair_graph
 from extraction.generation import generate_penalty_passes
 from extraction.step_support import (
@@ -14,16 +12,28 @@ from extraction.step_support import (
 )
 
 
-def graph_scene_result(row, text, *, error=None, diagnostics=None):
-    """Convert one response; preserve unresolved graphs as raw text."""
+SCENE_SCHEMA_VERSION = "scene-description/v2"
+
+
+def graph_scene_result(row, text, *, error=None, truncated=False, diagnostics=None, repeated=False):
+    """Convert one response; preserve unresolved or cut graphs as raw text.
+
+    ``repeated`` marks an output stopped before repeating a line: a graph that parses is
+    used as usual and only tagged REPEAT_OCCURRED for counting.
+    """
     if error is None and not text.strip():
         error = "model produced an empty graph"
-    parsed = parse_or_repair_graph(text) if error is None else None
     common = {"scene_idx": row["scene_idx"], "keyframes": row["keyframes"]}
+    if error is None and truncated:
+        # Output cut at the token limit is kept as text and never parsed.
+        return {**common, "graph": text, "parse_mode": "text", "semantic_warnings": [TOKEN_LIMIT]}, None
+    parsed = parse_or_repair_graph(text) if error is None else None
     parse_warning = parsed.error if parsed is not None else None
     warnings = list(parsed.warning) if parsed is not None else []
     if error is None and parsed is not None:
         structured = parsed.graph is not None and parse_warning is None
+        if repeated and not warnings:
+            warnings = [REPEAT_OCCURRED]
         return {
             **common,
             "graph": parsed.graph if structured else text,
@@ -41,7 +51,7 @@ def graph_scene_result(row, text, *, error=None, diagnostics=None):
     return None, failure
 
 
-def description_scene_result(row, text, *, content_id, error=None):
+def description_scene_result(row, text, *, content_id, error=None, truncated=False):
     common = {
         "content_id": content_id,
         "scene_idx": row["scene_idx"],
@@ -49,7 +59,10 @@ def description_scene_result(row, text, *, content_id, error=None):
     }
     description = text.strip()
     if description and error is None:
-        return {"schema_version": SCENE_SCHEMA_VERSION, **common, "description": description}, None
+        return {
+            "schema_version": SCENE_SCHEMA_VERSION, **common, "description": description,
+            "semantic_warnings": [TOKEN_LIMIT] if truncated else [],
+        }, None
     return None, {
         "schema_version": "description-generation-failure/v1",
         **common,
@@ -67,7 +80,6 @@ class SceneResults:
         records,
         progress,
         arm,
-        source,
         names,
         provenance=None,
     ):
@@ -76,13 +88,14 @@ class SceneResults:
         self.records = records
         self.progress = progress
         self.arm = arm
-        self.source = source
         self.names = names
         self.provenance = provenance
         self.penalty = None
         self.rows = {}
         self.contents = {}
         self.completed = set()
+        # REPEAT_OCCURRED records from an earlier pass, kept if a retry does no better.
+        self.repeat_fallback = {}
 
     def tasks(self):
         for visual, scene_rows in self.pending:
@@ -105,45 +118,20 @@ class SceneResults:
         truncated=False,
         final=True,
         tokens=None,
+        repeated=False,
     ):
         if task_id not in self.rows:
             raise RuntimeError(f"unexpected scene result: {task_id}")
         if task_id in self.completed:
             return
         cid, row = self.rows[task_id]
-        raw_text = text
-        if self.source == "minicpm":
-            from extraction.minicpm_output import normalize_minicpm_output
-
-            # Publish the unmodified response before publishing its parsed scene.
-            raw_path = self.scene_dir / "raw_responses" / f"{cid}.jsonl"
-            raw_rows = {
-                record["scene_idx"]: record
-                for record in (read_jsonl(raw_path) if raw_path.is_file() else [])
-            }
-            raw_rows[int(row["scene_idx"])] = {
-                "content_id": cid, "scene_idx": int(row["scene_idx"]),
-                "tokens": tokens, "raw_output": raw_text,
-            }
-            atomic_write_jsonl(
-                raw_path, sorted(raw_rows.values(), key=lambda record: record["scene_idx"]),
-                durable=True, sort_keys=False,
-            )
-            text = normalize_minicpm_output(text)
         if self.arm == "graph":
             record, failure = graph_scene_result(
-                row,
-                text,
-                error=error or ("graph: output truncated at token limit" if truncated else None),
-                diagnostics=diagnostics,
+                row, text, error=error, truncated=truncated, diagnostics=diagnostics, repeated=repeated,
             )
         else:
             record, failure = description_scene_result(
-                row,
-                text,
-                content_id=cid,
-                error=error
-                or ("description: output truncated at token limit" if truncated else None),
+                row, text, content_id=cid, error=error, truncated=truncated,
             )
         provenance = self.provenance
         if provenance and self.penalty is not None:
@@ -151,7 +139,11 @@ class SceneResults:
                 **provenance,
                 "settings": {**provenance["settings"], "actual_repetition_penalty": self.penalty},
             }
-        if record is not None:
+        fallback = self.repeat_fallback.pop(task_id, None)
+        if fallback is not None and outcome(record) not in USABLE_OUTCOMES:
+            # A retry that is no longer usable does not replace the usable repeated graph.
+            record = fallback
+        elif record is not None:
             record["tokens"] = tokens
             if provenance is not None:
                 record["provenance"] = provenance
@@ -159,18 +151,19 @@ class SceneResults:
         else:
             self.contents[cid][int(row["scene_idx"])] = {
                 "content_id": cid, "scene_idx": int(row["scene_idx"]),
-                "tokens": tokens, "error": failure["error"], "raw_output": raw_text,
+                "tokens": tokens, "error": failure["error"], "raw_output": text,
             }
         records = list(self.contents[cid].values())
         write_scene_results(self.scene_dir / f"{cid}.jsonl", records)
         self.records[cid] = records
         self.completed.add(task_id)
-        self.progress.complete(
-            task_id=task_id,
-            failed=failure is not None,
-            warning=record is not None and bool(record.get("semantic_warnings")),
-        )
-        return failure is not None
+        result = outcome(record)
+        self.progress.complete(task_id=task_id, outcome=result)
+        if result == "repeat_occurred":
+            self.repeat_fallback[task_id] = record
+        # Everything but success is generated again by a later penalty pass. A retry that
+        # succeeds is stored as a plain success, without the earlier warning.
+        return result != "success"
 
 
 def run_qwen_scenes(
@@ -183,7 +176,6 @@ def run_qwen_scenes(
     progress,
     arm,
     existing_records,
-    source=None,
     qwen_options=None,
     image_limit=6,
     runtime=None,
@@ -196,7 +188,6 @@ def run_qwen_scenes(
         records=existing_records,
         progress=progress,
         arm=arm,
-        source=source,
         names=names,
         provenance=provenance,
     )
@@ -208,6 +199,7 @@ def run_qwen_scenes(
             task_id,
             text,
             truncated=event.get("finish_reason") == "length",
+            repeated=bool(event.get("repeat_stopped")),
             final=final,
             tokens=qwen_output_tokens(event),
         )
@@ -255,7 +247,6 @@ def run_gemini_scenes(
         records=records_by_content,
         progress=progress,
         arm=arm,
-        source="gemini",
         names=names,
         provenance=provenance,
     )

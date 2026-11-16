@@ -1,0 +1,194 @@
+from copy import deepcopy
+
+import pytest
+import torch
+
+from arm_registry import Arm, registry
+from helpers import make_context
+from rec_experiments import CONFIG_KEY, load_experiments, parse_experiments
+
+
+def test_experiment_config_parsing_validation_and_snapshot(context, monkeypatch, tmp_path):
+    # Explicit sources, defaults, module order.
+    value = {"version": 1, "defaults": {"readout": "mean"}, "experiments": [
+        {"label": "custom-role", "source": "graph_gemini", "modules": ["role_fusion"]},
+        {"label": "combined", "source": "graph_qwen3vl_2b",
+         "modules": ["activity_hypergraph", "role_fusion"], "readout": "mean"},
+        {"label": "title-only", "source": "metadata"},
+        {"label": "description-only", "source": "desc_gemini"},
+    ]}
+    resolved = parse_experiments(value)
+    assert list(registry({CONFIG_KEY: resolved})) == [r["label"] for r in value["experiments"]]
+    assert resolved["experiments"][1]["modules"] == ["role_fusion", "activity_hypergraph"]
+    arms = registry({CONFIG_KEY: resolved})
+    assert arms["custom-role"].role_fusion and arms["custom-role"].extensions == ()
+    assert arms["title-only"].representation == "metadata"
+    assert arms["description-only"].model == "gemini"
+    assert all(arm.uses_title for arm in arms.values())
+
+    # Config module names resolve to result identity names.
+    def modules(names):
+        value = {"version": 1, "experiments": [
+            {"label": "trial", "source": "graph_qwen3vl_2b", "modules": names}]}
+        return parse_experiments(value)["experiments"][0]["modules"]
+
+    assert modules(["ASHA", "REAF"]) == ["role_fusion", "activity_hypergraph"]
+    assert modules(["REAF"]) == ["role_fusion"]
+    # Earlier names stay readable; an alias and its target are the same module.
+    assert modules(["activity_hypergraph"]) == ["activity_hypergraph"]
+    for duplicate in (["ASHA", "activity_hypergraph"], ["REAF", "REAF"], ["asha"]):
+        with pytest.raises(ValueError):
+            modules(duplicate)
+
+    # The snapshot survives file changes, and extraction does not require the file.
+    _snapshot_survives_file_changes(context)
+
+    # Invalid settings are rejected before outputs.
+    context = make_context(tmp_path / "invalid")
+    value = {"version": 1, "experiments": [{"label": "trial", "source": "graph_qwen3vl_2b"}]}
+    invalid = [None, {}, {**value, "experiments": []}]
+    # Unknown top-level and row keys are allowed (free-form notes, future settings).
+    parse_experiments({**value, "note": "x", "experiments": [{**value["experiments"][0], "note": "y"}]})
+    for change in ({"source": None}, {"label": "../bad"}, {"label": ".hidden"}, {"label": ""},
+                   {"label": "has space"}, {"label": "a/b"}, {"source": "missing"},
+                   {"modules": "role_fusion"}, {"modules": [None]}, {"modules": ["unknown"]},
+                   {"modules": ["role_fusion", "role_fusion"]},
+                   {"source": "metadata", "modules": ["role_fusion"]},
+                   {"source": "desc_qwen3vl_2b", "modules": ["activity_hypergraph"]}):
+        invalid.append({**value, "experiments": [{**value["experiments"][0], **change}]})
+    invalid += [{**value, "experiments": value["experiments"] * 2},
+                {**value, "experiments": [{"label": n, "source": "graph_qwen3vl_2b"}
+                                          for n in ["HGVRec", "hgvrec"]]}]
+    parse_experiments({**value, "experiments": [{"label": n, "source": "metadata"} for n in ["a", "b"]]})
+    for label in ("HGVRec", "graph+ASHA", "HGVRec_8b", "v1.2"):
+        parse_experiments({**value, "experiments": [{**value["experiments"][0], "label": label}]})
+    for item in invalid:
+        with pytest.raises(ValueError):
+            parse_experiments(item)
+    # Invalid configuration fails before feature preparation or directory creation.
+    context.config.pop(CONFIG_KEY)
+    (context.root / "rec_experiments_config.yaml").write_text("version: 1\nexperiments: []\n")
+    from validation.steps import embed_representations
+
+    monkeypatch.setattr("validation.graph_inputs.prepare", lambda *a, **k: pytest.fail("prepared invalid config"))
+    with pytest.raises(ValueError, match="rec_experiments_config.yaml"):
+        embed_representations(context)
+    assert not context.run_root.exists()
+
+
+def _snapshot_survives_file_changes(context):
+    import pickle
+    from pipeline_runtime import RunContext
+
+    snapshot = deepcopy(load_experiments(context))
+    (context.root / "rec_experiments_config.yaml").unlink()
+    assert load_experiments(pickle.loads(pickle.dumps(context))) == snapshot
+    fresh = RunContext.load(context.run_id, dataset=context.dataset, root=context.root)
+    assert fresh.scene_arm_dir("graph_gemini").name == "graph_gemini"
+    assert CONFIG_KEY not in fresh.config
+    with pytest.raises(ValueError, match="rec_experiments_config.yaml"):
+        load_experiments(fresh)
+
+
+def test_initial_definitions_preserve_legacy_weights_and_outputs(context, monkeypatch):
+    from helpers import prepare_inputs
+    from validation.graph_model import new_graph_model
+    from validation.steps import embed_representations, prepare_module, validation_config
+
+    prepare_inputs(context, monkeypatch)
+    embed_representations(context)
+    prepare_module(context)
+    config = validation_config(context)
+    legacy = [
+        Arm("base", "metadata", uses_title=True),
+        Arm("d", "description", "qwen3vl_2b", True, "desc_qwen3vl_2b", "mean"),
+        Arm("g0", "graph", "qwen3vl_2b", True, "graph_qwen3vl_2b", "mean"),
+        Arm("g1", "graph", "qwen3vl_2b", True, "graph_qwen3vl_2b", "mean", extensions=("segments",)),
+        Arm("g2", "graph", "qwen3vl_2b", True, "graph_qwen3vl_2b", "mean", True, ("segments",)),
+    ]
+    for current, previous in zip(registry(context.config), legacy, strict=True):
+        torch.manual_seed(42)
+        actual = new_graph_model(context, config, current, "cpu").eval()
+        with monkeypatch.context() as patch:
+            patch.setattr("arm_registry.registry", lambda config: {previous.name: previous})
+            torch.manual_seed(42)
+            expected = new_graph_model(context, config, previous.name, "cpu").eval()
+        assert actual.state_dict().keys() == expected.state_dict().keys()
+        assert all(torch.equal(t, expected.state_dict()[k]) for k, t in actual.state_dict().items())
+        with torch.no_grad():
+            assert torch.equal(actual.catalog_vectors(), expected.catalog_vectors())
+
+
+def replace_experiments(context, rows):
+    import yaml
+
+    path = context.root / "rec_experiments_config.yaml"
+    path.write_text(yaml.safe_dump({"version": 1, "experiments": rows}))
+    context.config.pop(CONFIG_KEY, None)
+    load_experiments(context)
+
+
+def test_custom_labels_and_sources_complete_the_pipeline(monkeypatch, tmp_path):
+    from helpers import make_context
+
+    cases = [
+        ([{"label": "just-description", "source": "desc_qwen3vl_2b"}], None),
+        ([{"label": "title-only", "source": "metadata"},
+          {"label": "base", "source": "graph_qwen3vl_2b", "modules": ["role_fusion"]}], "title-only"),
+    ]
+    for index, (rows, baseline) in enumerate(cases):
+        with monkeypatch.context() as patch:
+            _complete_pipeline(make_context(tmp_path / f"case{index}"), patch, rows, baseline)
+
+
+def _complete_pipeline(context, monkeypatch, rows, baseline):
+    from artifact_io import read_json
+    from helpers import prepare_inputs
+    from validation.steps import embed_representations, prepare_module, run_recommendation, run_diagnosis
+    from validation.graph_model import new_graph_model
+    from validation.steps import validation_config
+
+    prepare_inputs(context, monkeypatch)
+    replace_experiments(context, rows)
+    embed_representations(context)
+    assert prepare_module(context)["statistics"] == {}
+    result = run_recommendation(context)
+    assert result["completed"] == 3 * len(rows)
+    run_diagnosis(context)
+    document = read_json(context.diagnosis_path(None))
+    assert document["recommendations"]["baseline"] == baseline
+    assert (document["recommendations"]["base_relative_changes"] is None) == (baseline is None)
+    assert document["statistics"]["comparison_count"] == len(rows) * (len(rows) - 1) // 2
+    assert document["targets"] == [r["label"] for r in rows]
+    if baseline:
+        model = new_graph_model(context, validation_config(context), "base", "cpu")
+        assert model.graph_encoder.role_fusion is not None
+        assert not hasattr(model, "item_projection")
+
+
+def test_editing_experiment_list_reuses_results_and_force_retrains(context, monkeypatch):
+    from artifact_io import read_json
+    from helpers import train_inputs
+    from validation.steps import embed_representations, prepare_module, run_recommendation
+
+    train_inputs(context, monkeypatch)
+    saved = {p: p.read_bytes() for p in context.recommendations_dir.glob("seed_*/*/*") if p.is_file()}
+    rows = [r for r in load_experiments(context)["experiments"] if r["label"] in {"base", "graph-activity"}]
+    added = {"label": "role-only", "source": "graph_qwen3vl_2b", "modules": ["role_fusion"]}
+    replace_experiments(context, rows + [added])
+    assert embed_representations(context)["generated_sources"] == []
+    prepare_module(context)
+    result = run_recommendation(context)
+    assert result["skipped"] == 6 and result["completed"] == 3
+    assert all(p.read_bytes() == value for p, value in saved.items())
+    original = read_json(context.recommendations_dir / "seed_42" / "graph-activity" / "identity.json")
+    replace_experiments(context, [rows[1]])
+    assert run_recommendation(context)["skipped"] == 3
+    assert all(p.read_bytes() == value for p, value in saved.items())
+    assert original["experiment_definition"]["modules"] == ["activity_hypergraph"]
+    # A changed definition reuses finished files until --force retrains that label.
+    replace_experiments(context, [{**rows[1], "modules": []}])
+    assert run_recommendation(context)["skipped"] == 3
+    assert run_recommendation(context, force=True)["completed"] == 3
+    changed = read_json(context.recommendations_dir / "seed_42" / "graph-activity" / "identity.json")
+    assert changed["experiment_definition"]["modules"] == []

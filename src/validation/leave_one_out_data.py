@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 
 import numpy as np
 
 
-DAY = 86_400_000
+def metrics_from_rank(rank, cutoffs=(4, 8, 10, 20)):
+    result = {}
+    for cutoff in cutoffs:
+        result[f"HR@{cutoff}"] = float(rank <= cutoff)
+        result[f"NDCG@{cutoff}"] = 1.0 / math.log2(rank + 1) if rank <= cutoff else 0.0
+    return result
+
+
 SCHEMA = "microlens-leave-one-out/v1"
 PROTOCOL = "leave_one_out"
 
@@ -50,8 +58,8 @@ class EventTable:
         users = []
         for user in self.users:
             ids = self.by_user[user]
-            if len(ids) < 5 or len(ids) > 13:
-                raise ValueError("leave-one-out sequences must contain 5..13 events")
+            if len(ids) < 3:
+                raise ValueError("leave-one-out needs at least 3 events per user (train, validation, test)")
             train, validation, test = ids[:-2], ids[-2], ids[-1]
             phases["train"].extend(train)
             phases["validation"].append(validation)

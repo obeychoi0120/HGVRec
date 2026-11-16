@@ -1,19 +1,47 @@
 """Role-aware scene encoding and differentiable video pooling for SASRec."""
 
+import math
+
 import numpy as np
 
 from validation.model import SASRec, SingleLayerResidualMLP, torch, nn
 from validation.graph_inputs import GraphStore
-from validation.graph_context import (
-    ATTENTION_AGGREGATIONS, GRAPH_MODEL, SCENE_AGGREGATIONS, SCENE_EXCHANGES, SCENE_TRANSFORMER,
-    TRANSFORMER_VARIANTS, check_extensions,
-)
 from validation.graph_batching import PackedGraphStore, GRAPH_EXECUTION_VERSION
 from validation.config import GraphExecutionConfig
-from validation.scene_attention import SceneAttentionGCN, SceneAttentionPool, recorded_weights
-from validation.scene_gcn import SceneGCN, scene_groups
-from validation.scene_transformer import SceneTransformer
-from validation.profiling import span, timed, workload, is_profiling, checkpoint_contexts
+
+
+def scene_groups(offsets):
+    """{"scene_group_<n>": [videos with n scenes, n] batch-local scene rows}; videos without scenes are absent."""
+    offsets = np.asarray(offsets, dtype=np.int64)
+    counts = np.diff(offsets)
+    return {
+        f"scene_group_{size}": offsets[:-1][counts == size, None] + np.arange(size)
+        for size in np.unique(counts)
+        if size > 0
+    }
+
+
+def unit_rms(values, eps=1e-8):
+    """Unit L2 direction rescaled to unit RMS; only the attention scores see it.
+
+    Raw scene features have norm ~1, which would give scores near 0 and almost uniform
+    weights for many steps; values are never rescaled.
+    """
+    return nn.functional.normalize(values, dim=-1, eps=eps) * math.sqrt(values.shape[-1])
+
+
+HIDDEN_DIM = 128
+# Optional scene modules: ASHA reads the scene_segments sidecar; GNN_ATTN exchanges scenes within a video.
+EXTENSIONS = frozenset({"segments", "scene_attention"})
+
+
+def check_extensions(extensions, aggregation):
+    extensions = frozenset(extensions)
+    if aggregation != "mean":
+        raise ValueError("scene aggregation must be mean")
+    if extensions - EXTENSIONS:
+        raise ValueError("unknown scene extension: " + ", ".join(sorted(extensions - EXTENSIONS)))
+    return extensions
 
 
 def segment_mean(values, indices, count):
@@ -30,24 +58,49 @@ def xavier_normal(rows, columns, generator):
     return torch.empty(rows, columns).normal_(0.0, std, generator=generator)
 
 
-class SceneRoleEncoder(nn.Module):
-    """Entity→Action role gather, scene MLP, optional scene exchange, and video pooling.
+class SceneAttentionExchange(nn.Module):
+    """One single-head attention exchange among the scenes of each video: h + relu(P (A h) + p).
 
-    Exchange: cosine GCN, attention GCN or Transformer; pooling: mean or attention. gnn_attn may add
-    the segments and video_node extensions (graph_context.EXTENSION_MODELS); mean may add segments, which
-    is then the only path between scenes.
+    Scores use the title-free scene content before the Scene MLP; values are Scene MLP outputs.
+    Weights come from a private RNG and are bare Parameters (untouched by the Linear reset), so
+    every other parameter starts as in the matching model without the exchange.
     """
+
+    def __init__(self, dimension, similarity_dim, key_dim):
+        super().__init__()
+        generator = torch.Generator().manual_seed((torch.initial_seed() + 20) % 2**63)
+        # N(0, 1/(2 fan_in)) on unit-RMS inputs gives attention logits of std ~0.5.
+        std = (2 * similarity_dim) ** -0.5
+        self.query = nn.Parameter(torch.empty(key_dim, similarity_dim).normal_(0.0, std, generator=generator))
+        self.key = nn.Parameter(torch.empty(key_dim, similarity_dim).normal_(0.0, std, generator=generator))
+        self.projection = nn.Parameter(xavier_normal(dimension, dimension, generator))
+        self.projection_bias = nn.Parameter(torch.zeros(dimension))
+
+    def attention(self, similarity):
+        """[videos, n, similarity_dim] -> row-softmax weights [videos, n, n], self included."""
+        units = unit_rms(similarity)
+        scores = (units @ self.query.t()) @ (units @ self.key.t()).transpose(-1, -2)
+        return (scores / self.query.shape[0] ** 0.5).softmax(dim=-1)
+
+    def forward(self, scenes, similarity, groups):
+        output = torch.zeros_like(scenes)
+        for indices in groups:  # [videos, n] batch-local scene rows of videos with n scenes
+            values = scenes[indices]
+            mixed = self.attention(similarity[indices]) @ values
+            updated = values + nn.functional.relu(mixed @ self.projection.t() + self.projection_bias)
+            output = output.index_copy(0, indices.reshape(-1), updated.flatten(0, 1))
+        return output
+
+
+class SceneRoleEncoder(nn.Module):
+    """Role Fusion (B), Scene MLP, optional scene attention exchange, optional hypergraph (A), mean readout."""
 
     ROLE_INDICES = (0, 1, 2, 4)  # actor, target, tool, place; receiver is ignored.
 
-    def __init__(self, feature_dim=1024, hidden=GRAPH_MODEL["hidden_dim"], aggregation="mean",
-                 dropout=0.0, role_fusion=True, extensions=()):
+    def __init__(self, feature_dim=1024, hidden=HIDDEN_DIM, aggregation="mean",
+                 role_fusion=True, extensions=()):
         super().__init__()
         self.extensions = check_extensions(extensions, aggregation)
-        if aggregation not in SCENE_AGGREGATIONS:
-            raise ValueError(
-                "Scene role encoder supports " + ", ".join(SCENE_AGGREGATIONS) + " pooling"
-            )
         self.aggregation = aggregation
         self.hidden_dim = hidden
         self.output_dim = hidden * 4
@@ -60,23 +113,10 @@ class SceneRoleEncoder(nn.Module):
             self.role_states = nn.Parameter(torch.empty(4, 2, hidden))
             nn.init.normal_(self.role_states, std=0.02)
         self.scene_mlp = SingleLayerResidualMLP(self.output_dim)
-        if aggregation == "gnn":
-            self.gcn = SceneGCN(self.output_dim)
-        elif aggregation in TRANSFORMER_VARIANTS:
-            self.scene_transformer = SceneTransformer(
-                self.output_dim, dropout=dropout,
-                **SCENE_TRANSFORMER, **TRANSFORMER_VARIANTS[aggregation],
-            )
-        elif aggregation in ("gnn_attn", "self_only"):
-            # Same attribute as gnn: the checkpoints differ only by gcn.query/gcn.key.
-            self.gcn = SceneAttentionGCN(
-                self.output_dim, hidden * 3, hidden, self_only=aggregation == "self_only"
-            )
-        elif aggregation == "attn_pool":
-            self.attention_pool = SceneAttentionPool(self.output_dim, hidden)
+        if "scene_attention" in self.extensions:
+            self.scene_attention = SceneAttentionExchange(self.output_dim, hidden * 3, hidden)
         if "segments" in self.extensions:
-            # Bare parameters from a private generator: no global RNG use, so every other parameter
-            # and the gate-0 forward equal gnn_attn bit for bit.
+            # Private RNG preserves the matching non-hypergraph model at gate 0.
             generator = torch.Generator().manual_seed((torch.initial_seed() + 18) % 2**63)
             width = self.output_dim
             self.segment_weight = nn.Parameter(xavier_normal(width, width + 2, generator))
@@ -85,10 +125,6 @@ class SceneRoleEncoder(nn.Module):
             self.segment_scene_bias = nn.Parameter(torch.zeros(width))
             self.segment_video_weight = nn.Parameter(xavier_normal(width, width, generator))
             self.segment_gates = nn.Parameter(torch.zeros(2))  # [scene update, video readout]
-        if "video_node" in self.extensions:
-            # scene -> video (steps 1 and 3, shared) and video -> scene (step 2) messages.
-            self.video_up = nn.Linear(self.output_dim * 2, self.output_dim)
-            self.video_down = nn.Linear(self.output_dim * 2, self.output_dim)
 
     def _role_inputs(self, batch, action_ids):
         if "role_entities" in batch:
@@ -107,7 +143,7 @@ class SceneRoleEncoder(nn.Module):
         return entities, states
 
     def _segments(self, batch, scenes, video_count):
-        """Scene-segment hypergraph after the scene exchange; returns (scenes, per-video segment readout)."""
+        """Hypergraph after Scene MLP (and the scene exchange, if any); returns scenes and per-video segment readout."""
         members, ids = batch["segment_scenes"], batch["segment_ids"]
         videos = batch["scene_videos"]
         # Batch-local segment ids are dense and fewer than the incidence pairs.
@@ -135,23 +171,11 @@ class SceneRoleEncoder(nn.Module):
         readout = (per_video / segments.clamp_min(1).unsqueeze(-1)) @ self.segment_video_weight.t()
         return scenes, self.segment_gates[1] * readout * (segments > 0).unsqueeze(-1)
 
-    def _video_node(self, title, scenes, scene_videos, video_count):
-        """Three sequential steps: scenes -> video, video -> scenes, scenes -> video (W_up shared)."""
-        start = self.scene_mlp(torch.cat([title, title.new_zeros((video_count, self.hidden_dim * 3))], dim=-1))
-        gathered = segment_mean(scenes, scene_videos, video_count)
-        video = start + nn.functional.relu(self.video_up(torch.cat([start, gathered], dim=-1)))
-        scenes = scenes + nn.functional.relu(
-            self.video_down(torch.cat([scenes, video[scene_videos]], dim=-1))
-        )
-        gathered = segment_mean(scenes, scene_videos, video_count)
-        return video + nn.functional.relu(self.video_up(torch.cat([video, gathered], dim=-1)))
-
     def forward(self, batch):
         video_count = len(batch["offsets"]) - 1
         scene_count = len(batch["contexts"])
-        with span("title_projection", cuda=True):
-            title = self.title_projection(batch["titles"])
-            title = title.masked_fill(~batch["title_available"].bool()[:, None], 0.0)
+        title = self.title_projection(batch["titles"])
+        title = title.masked_fill(~batch["title_available"].bool()[:, None], 0.0)
         scenes = title.new_empty((0, self.output_dim))
         if scene_count:
             entity_ids = batch.get("entity_ids")
@@ -159,64 +183,43 @@ class SceneRoleEncoder(nn.Module):
             if entity_ids is None:
                 entity_ids = torch.where(batch["types"] == 0)[0]
                 action_ids = torch.where(batch["types"] == 1)[0]
-            with span("entity_projection", cuda=True):
-                entities = self.entity_projection(batch["features"][entity_ids])
-            with span("action_projection", cuda=True):
-                actions = self.action_projection(batch["features"][action_ids])
+            entities = self.entity_projection(batch["features"][entity_ids])
+            actions = self.action_projection(batch["features"][action_ids])
             if len(action_ids) and self.role_fusion is not None:
-                with span("role_fusion", cuda=True):
-                    role_entities, role_states = self._role_inputs(batch, action_ids)
-                    # Node IDs are local to the batch; compact Entity rows differ.
-                    lookup = action_ids.new_full((len(batch["types"]),), -1)
-                    lookup[entity_ids] = torch.arange(len(entity_ids), device=entity_ids.device)
-                    padded_entities = torch.cat([entities.new_zeros((1, self.hidden_dim)), entities])
-                    role_vectors = []
-                    for role in range(4):
-                        ids = role_entities[:, role]
-                        rows = lookup[ids.clamp_min(0)] + 1
-                        rows = rows.masked_fill(ids < 0, 0)
-                        linked = padded_entities[rows]
-                        with span("state_lookup", cuda=True):
-                            state = nn.functional.embedding(role_states[:, role], self.role_states[role])
-                        role_vectors.append(torch.where((ids >= 0)[:, None], linked, state))
-                    actions = actions + nn.functional.relu(
-                        self.role_fusion(torch.cat([actions, *role_vectors], dim=-1))
-                    )
-            with span("scene_readout", cuda=True):
-                entity_mean = segment_mean(entities, batch["node_scenes"][entity_ids], scene_count)
-                action_mean = segment_mean(actions, batch["node_scenes"][action_ids], scene_count)
-                with span("context_projection", cuda=True):
-                    context = self.context_projection(batch["contexts"])
-                scene_title = title[batch["scene_videos"]]
-                if "video_node" in self.extensions:
-                    # The title starts the video node instead of being copied into every scene.
-                    scene_title = torch.zeros_like(scene_title)
-                scenes = torch.cat([scene_title, entity_mean, action_mean, context], dim=-1)
-                if self.aggregation in ("gnn", "gnn_attn", "self_only"):
-                    similarity_features = torch.cat([entity_mean, action_mean, context], dim=-1)
-            with span("scene_mlp", cuda=True):
-                scenes = self.scene_mlp(scenes)
-            if self.aggregation in SCENE_EXCHANGES or self.aggregation == "self_only":
+                role_entities, role_states = self._role_inputs(batch, action_ids)
+                # Node IDs are local to the batch; compact Entity rows differ.
+                lookup = action_ids.new_full((len(batch["types"]),), -1)
+                lookup[entity_ids] = torch.arange(len(entity_ids), device=entity_ids.device)
+                padded_entities = torch.cat([entities.new_zeros((1, self.hidden_dim)), entities])
+                role_vectors = []
+                for role in range(4):
+                    ids = role_entities[:, role]
+                    rows = lookup[ids.clamp_min(0)] + 1
+                    rows = rows.masked_fill(ids < 0, 0)
+                    linked = padded_entities[rows]
+                    state = nn.functional.embedding(role_states[:, role], self.role_states[role])
+                    role_vectors.append(torch.where((ids >= 0)[:, None], linked, state))
+                actions = actions + nn.functional.relu(
+                    self.role_fusion(torch.cat([actions, *role_vectors], dim=-1))
+                )
+            entity_mean = segment_mean(entities, batch["node_scenes"][entity_ids], scene_count)
+            action_mean = segment_mean(actions, batch["node_scenes"][action_ids], scene_count)
+            context = self.context_projection(batch["contexts"])
+            scene_title = title[batch["scene_videos"]]
+            scenes = torch.cat([scene_title, entity_mean, action_mean, context], dim=-1)
+            scenes = self.scene_mlp(scenes)
+            if "scene_attention" in self.extensions:
                 groups = [value for key, value in batch.items() if key.startswith("scene_group_")]
                 if not groups:
                     groups = [torch.as_tensor(value, device=scenes.device)
                               for value in scene_groups(batch["offsets"]).values()]
-                if self.aggregation in TRANSFORMER_VARIANTS:
-                    scenes = self.scene_transformer(scenes, groups)
-                else:
-                    scenes = self.gcn(scenes, similarity_features, groups)
+                similarity = torch.cat([entity_mean, action_mean, context], dim=-1)
+                scenes = self.scene_attention(scenes, similarity, groups)
             if "segments" in self.extensions:
-                with span("segment_update", cuda=True):
-                    scenes, segment_readout = self._segments(batch, scenes, video_count)
-        with span("video_pooling", cuda=True):
-            if self.aggregation == "attn_pool" and scene_count:
-                output = self.attention_pool(scenes, batch["scene_videos"], video_count)
-            elif "video_node" in self.extensions:
-                output = self._video_node(title, scenes, batch["scene_videos"], video_count)
-            else:
-                output = segment_mean(scenes, batch["scene_videos"], video_count)
-            if "segments" in self.extensions and scene_count:
-                output = output + segment_readout
+                scenes, segment_readout = self._segments(batch, scenes, video_count)
+        output = segment_mean(scenes, batch["scene_videos"], video_count)
+        if "segments" in self.extensions and scene_count:
+            output = output + segment_readout
         # Only videos with no valid scenes use the title-only scene path.
         missing = [i for i in range(video_count) if batch["offsets"][i] == batch["offsets"][i + 1]]
         if missing:
@@ -227,17 +230,16 @@ class SceneRoleEncoder(nn.Module):
 
 
 class DescriptionSceneEncoder(nn.Module):
-    """Direct scene Description BGE, title concatenation, optional inter-scene transfer."""
+    """Scene Description and title encoding, Scene MLP and mean readout."""
 
     def __init__(self, feature_dim, hidden=128, aggregation="mean"):
         super().__init__()
         self.hidden_dim = hidden
+        check_extensions((), aggregation)
         self.aggregation = aggregation
         self.title_projection = nn.Linear(feature_dim, hidden)
         self.description_projection = nn.Linear(feature_dim, hidden * 3)
         self.scene_mlp = SingleLayerResidualMLP(hidden * 4)
-        if aggregation == "gnn_attn":
-            self.gcn = SceneAttentionGCN(hidden * 4, hidden * 3, hidden)
 
     def forward(self, batch):
         count = len(batch["offsets"]) - 1
@@ -245,12 +247,6 @@ class DescriptionSceneEncoder(nn.Module):
         title = title.masked_fill(~batch["title_available"].bool()[:, None], 0.0)
         description = self.description_projection(batch["contexts"])
         scenes = self.scene_mlp(torch.cat([title[batch["scene_videos"]], description], dim=-1))
-        if self.aggregation == "gnn_attn" and len(scenes):
-            groups = [value for key, value in batch.items() if key.startswith("scene_group_")]
-            if not groups:
-                groups = [torch.as_tensor(value, device=scenes.device)
-                          for value in scene_groups(batch["offsets"]).values()]
-            scenes = self.gcn(scenes, description, groups)
         output = segment_mean(scenes, batch["scene_videos"], count)
         missing = [i for i in range(count) if batch["offsets"][i] == batch["offsets"][i + 1]]
         if missing:
@@ -258,11 +254,6 @@ class DescriptionSceneEncoder(nn.Module):
             fallback = torch.cat([title[ids], title.new_zeros((len(ids), self.hidden_dim * 3))], -1)
             output = output.index_copy(0, ids, self.scene_mlp(fallback))
         return output.masked_fill(~batch["available"].bool()[:, None], 0.0)
-
-
-def graph_batch(store, item_ids, device):
-    """Standalone mutable batch API; model training reuses a PackedGraphStore."""
-    return PackedGraphStore(store, feature_cache_mb=0).batch(item_ids, device, prepared=False)
 
 
 class GraphSASRec(SASRec):
@@ -313,16 +304,10 @@ class GraphSASRec(SASRec):
         else:
             self.graph_encoder = SceneRoleEncoder(
                 store["features"].shape[1], hidden=self.title_dim, aggregation=aggregation,
-                dropout=dropout, role_fusion=role_fusion, extensions=extensions,
+                role_fusion=role_fusion, extensions=extensions,
             )
         self.graph_encoder.apply(self._reset_parameters)
         self._reset_attention(self.graph_encoder)
-        # Undo the shared Linear reset where attention needs its own start.
-        if aggregation == "attn_pool":
-            # Uniform scene weights start exactly as mean pooling.
-            self.graph_encoder.attention_pool.start_uniform()
-        elif aggregation in ("gnn_attn", "self_only"):
-            self.graph_encoder.gcn.reset_query_key()
         self._vectors = self._indices = None
         self.embedding_dim = embedding_dim
         self.aggregation = aggregation
@@ -345,8 +330,7 @@ class GraphSASRec(SASRec):
 
     def _calculate_chunk(self, batch):
         # Checkpoint backward recomputes only neural operations on static inputs.
-        with span("graph_encoder", cuda=True):
-            return self.graph_encoder(batch)
+        return self.graph_encoder(batch)
 
     def _use_checkpoint(self, items):
         if not self.training or not torch.is_grad_enabled():
@@ -368,35 +352,25 @@ class GraphSASRec(SASRec):
             + edges * hidden * 4
             + scenes * (feature + self.embedding_dim * 12)
         )
-        if self.aggregation in SCENE_EXCHANGES:
+        if "scene_attention" in getattr(self.graph_encoder, "extensions", ()):
             pairs = int(np.square(self.packed.scene_counts[indices]).sum())
-        if self.aggregation == "gnn":
-            estimate += 4 * (pairs * 8 + scenes * self.embedding_dim * 8)
-        elif self.aggregation == "gnn_attn":
-            # gnn activations plus query/key projections; scores reuse the adjacency budget.
             estimate += 4 * (pairs * 8 + scenes * (self.embedding_dim * 8 + hidden * 4))
-        elif self.aggregation == "attn_pool":
-            # Score hidden layer and tanh, weighted scene copies; no pairwise term.
-            estimate += 4 * scenes * (hidden * 3 + self.embedding_dim * 2)
-        elif self.aggregation in TRANSFORMER_VARIANTS:
-            # Per layer: score/softmax/dropout per head; LN, QKV, residual and FFN activations.
-            layers, heads, ratio = (SCENE_TRANSFORMER[k] for k in ("layers", "heads", "ffn_ratio"))
-            estimate += 4 * layers * (
-                pairs * heads * 4 + scenes * self.embedding_dim * (12 + 3 * ratio)
-            )
         free, _ = torch.cuda.mem_get_info(device)
         return estimate > min(8 * 1024**3, int(free * 0.35))
 
     def _batch_options(self):
-        # Only the segments extension adds a key, so other batches stay byte-identical.
-        options = {"group_scenes": self.aggregation in SCENE_EXCHANGES}
-        if "segments" in getattr(self.graph_encoder, "extensions", ()):
+        options = {}
+        extensions = getattr(self.graph_encoder, "extensions", ())
+        if "segments" in extensions:
             options["scene_segments"] = True
+        if "scene_attention" in extensions:
+            options["scene_groups"] = True
         return options
 
     def _calculate(self, ids):
         from torch.utils.checkpoint import checkpoint
 
+        exchange = "scene_attention" in getattr(self.graph_encoder, "extensions", ())
         vectors, chunks = [], []
         chunk, nodes, scene_pairs = [], 0, 0
         for item in ids:
@@ -405,8 +379,7 @@ class GraphSASRec(SASRec):
             if chunk and (
                 len(chunk) >= self.execution.chunk_items
                 or nodes + count > self.execution.chunk_nodes
-                or (self.aggregation in SCENE_EXCHANGES
-                    and scene_pairs + pairs > self.execution.chunk_scene_pairs)
+                or (exchange and scene_pairs + pairs > self.execution.chunk_scene_pairs)
             ):
                 chunks.append(chunk)
                 chunk, nodes, scene_pairs = [], 0, 0
@@ -416,16 +389,6 @@ class GraphSASRec(SASRec):
         if chunk:
             chunks.append(chunk)
         use_checkpoint = self._use_checkpoint(ids)
-        if is_profiling():
-            selected = np.asarray(ids, dtype=np.int64) - 1
-            workload(
-                unique_videos=len(ids),
-                scenes=self.packed.scene_counts[selected].sum(),
-                nodes=self.packed.node_counts[selected].sum(),
-                edges=self.packed.edge_counts[selected].sum(),
-                chunks=len(chunks),
-                checkpoint_batches=int(use_checkpoint),
-            )
         if self.training:
             self.execution_counts["checkpoint_batches" if use_checkpoint else "direct_batches"] += 1
         device = self.title_projection.weight.device
@@ -433,8 +396,7 @@ class GraphSASRec(SASRec):
             batch = self.packed.batch(np.asarray(items) - 1, device, **self._batch_options())
             self.execution_counts["chunks"] += 1
             if use_checkpoint:
-                options = {"context_fn": checkpoint_contexts} if is_profiling() else {}
-                values = checkpoint(self._calculate_chunk, batch, use_reentrant=False, **options)
+                values = checkpoint(self._calculate_chunk, batch, use_reentrant=False)
             else:
                 values = self._calculate_chunk(batch)
             vectors.append(values)
@@ -444,15 +406,13 @@ class GraphSASRec(SASRec):
             else self.title_projection.weight.new_empty((0, self.embedding_dim))
         )
 
-    @timed("graph_items")
     def prepare_items(self, ids):
-        with span("unique_ids", cuda=False):
-            if isinstance(ids, torch.Tensor):
-                ids = ids.detach().cpu().numpy()
-            unique = np.unique(np.asarray(ids, dtype=np.int64))
-            unique = unique[unique != 0]
-            if len(unique) and (unique[0] < 1 or unique[-1] > self.item_count):
-                raise ValueError("graph item ID outside catalog")
+        if isinstance(ids, torch.Tensor):
+            ids = ids.detach().cpu().numpy()
+        unique = np.unique(np.asarray(ids, dtype=np.int64))
+        unique = unique[unique != 0]
+        if len(unique) and (unique[0] < 1 or unique[-1] > self.item_count):
+            raise ValueError("graph item ID outside catalog")
         self._vectors = torch.cat(
             [
                 self.title_projection.weight.new_zeros((1, self.embedding_dim)),
@@ -460,12 +420,11 @@ class GraphSASRec(SASRec):
             ]
         )
         # Build the lookup in CPU memory once; transfer it in a single operation.
-        with span("item_lookup", cuda=True):
-            indices = np.full(self.item_count + 1, -1, dtype=np.int64)
-            indices[0] = 0
-            indices[unique] = np.arange(1, len(unique) + 1)
-            self._indices = torch.as_tensor(indices, device=self._vectors.device)
-            self._catalog_cached = len(unique) == self.item_count
+        indices = np.full(self.item_count + 1, -1, dtype=np.int64)
+        indices[0] = 0
+        indices[unique] = np.arange(1, len(unique) + 1)
+        self._indices = torch.as_tensor(indices, device=self._vectors.device)
+        self._catalog_cached = len(unique) == self.item_count
 
     def item_vectors(self, item_ids):
         if self._vectors is None:
@@ -490,53 +449,24 @@ class GraphSASRec(SASRec):
                 self.store["features"].nbytes if self.packed.feature_cache is not None else 0
             ),
         }
-        if hasattr(self.store, "report"):
-            report["role_corruption"] = self.store.report
-        if self.aggregation == "self_only":
-            report["attention_query_key_active"] = False
-        if self.aggregation in TRANSFORMER_VARIANTS:
-            # Learned [attention, FFN] scales per layer; 0 means that sublayer stayed unused.
-            report["scene_transformer_residual_scales"] = (
-                self.graph_encoder.scene_transformer.residual_scales()
-            )
-        if self.aggregation in ATTENTION_AGGREGATIONS:
-            report["scene_attention_summary"] = self.scene_attention_summary()
         if "segments" in getattr(self.graph_encoder, "extensions", ()):
             gates = self.graph_encoder.segment_gates.detach().cpu().tolist()
             report["segment_gates"] = {"scene_update": float(gates[0]), "video_readout": float(gates[1])}
+        if "scene_attention" in getattr(self.graph_encoder, "extensions", ()):
+            exchange = self.graph_encoder.scene_attention
+            report["scene_attention_norms"] = {name: float(getattr(exchange, name).detach().norm())
+                                               for name in ("query", "key", "projection")}
         return report
-
-    @torch.no_grad()
-    def scene_attention_summary(self):
-        """Learned scene weights over the whole catalog; all statistics are 1 for uniform weights.
-
-        A separate no-grad pass (no dropout in these encoders) that leaves the item
-        cache and execution counters untouched.
-        """
-        encoder = self.graph_encoder
-        module = encoder.attention_pool if self.aggregation == "attn_pool" else encoder.gcn
-        device = self.title_projection.weight.device
-        items, size = np.arange(self.item_count), self.execution.chunk_items
-        with recorded_weights(module) as summary:
-            for start in range(0, len(items), size):
-                encoder(self.packed.batch(items[start:start + size], device, **self._batch_options()))
-        return summary
 
 
 def parameter_report(model, branch):
     total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    inactive = 0
-    if branch == "g1c":
-        inactive = sum(p.numel() for module in (model.graph_encoder.gcn.query,
-                                              model.graph_encoder.gcn.key)
-                       for p in module.parameters())
-    hidden = model.graph_encoder.hidden_dim if branch != "base" else 0
-    return {
-        "trainable": total,
-        "active_trainable": total - inactive,
-        "inactive_query_key": inactive,
-        "removed_role_fusion": 5 * hidden ** 2 + 9 * hidden if branch == "g1a" else 0,
-    }
+    encoder = getattr(model, "graph_encoder", None)
+    removed = 0
+    if isinstance(encoder, SceneRoleEncoder) and encoder.role_fusion is None:
+        hidden = encoder.hidden_dim
+        removed = 5 * hidden ** 2 + 9 * hidden
+    return {"trainable": total, "active_trainable": total, "removed_role_fusion": removed}
 
 
 def new_graph_model(context, config, branch, device):
@@ -548,10 +478,6 @@ def new_graph_model(context, config, branch, device):
         from validation.graph_inputs import load_scene_segments
 
         store.scene_segments = load_scene_segments(store.directory, arm.segments)
-    if branch == "g1b":
-        from validation.role_corruption import CorruptedGraphStore
-
-        store = CorruptedGraphStore(store)
     if store["features"].shape[1] != config.encoder.embedding_dim:
         raise ValueError("graph feature dimension mismatch; rerun embed-representations")
     kwargs = dict(
@@ -562,7 +488,7 @@ def new_graph_model(context, config, branch, device):
         num_heads=config.model.num_heads,
         dropout=config.model.dropout,
     )
-    if branch == "base":
+    if arm.representation == "metadata":
         features = np.array(store["features"][store["titles"]], copy=True)
         return SASRec(
             **kwargs,

@@ -165,11 +165,3 @@ def _scene_boundary(
     except (TypeError, ValueError):
         return fallback
     return int(number) if number.is_integer() else number
-
-
-def image_path_for_timestamp(paths: list[Path], timestamp: Any) -> Path | None:
-    try:
-        name = timestamp_stem(timestamp)
-    except (TypeError, ValueError):
-        return None
-    return next((path for path in paths if path.stem == name), None)

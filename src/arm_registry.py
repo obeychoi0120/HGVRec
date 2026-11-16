@@ -2,10 +2,6 @@
 
 from dataclasses import dataclass
 
-CONCAT_POLICY = "title-summary-double-newline/v1"
-EXPERIMENT_CONFIG_VERSION = "v6"
-RECOMMENDATION_ARM_CONTRACT = "gnn-attn-aggregation/v1"
-
 
 @dataclass(frozen=True)
 class Arm:
@@ -16,50 +12,39 @@ class Arm:
     scene_arm: str | None = None
     aggregation: str = "mean"
     role_fusion: bool = False
-    # Optional stages (validation.graph_context.EXTENSION_MODELS; segments also on mean); with "segments",
-    # the scene_segments sidecar variant of the source bundle ("true" or "shuffled").
+    # Internal sidecar extensions; public module names live in rec_experiments.
     extensions: tuple[str, ...] = ()
-    segments: str = "true"
+    # ASHA ablation: (variant, seed) of validation.segment_variants; None is the default segments.
+    segments: tuple[str, int] | None = None
 
 
-ARMS = (
-    Arm("base", "metadata", uses_title=True),
-    Arm("d0", "description", "qwen3vl", True, "desc_qwen3vl"),
-    Arm("d1", "description", "qwen3vl", True, "desc_qwen3vl", "gnn_attn"),
-    Arm("g0", "graph", "qwen3vl", True, "graph_qwen3vl", role_fusion=True),
-    Arm("g1", "graph", "qwen3vl", True, "graph_qwen3vl", "gnn_attn", True),
-    # G1 plus gnn_attn extensions: video node, activity segments, both.
-    Arm("g2", "graph", "qwen3vl", True, "graph_qwen3vl", "gnn_attn", True, ("video_node",)),
-    Arm("g3", "graph", "qwen3vl", True, "graph_qwen3vl", "gnn_attn", True, ("segments",)),
-    Arm("g4", "graph", "qwen3vl", True, "graph_qwen3vl", "gnn_attn", True, ("segments", "video_node")),
-    # Ablations: G1 without Fusion, corrupted role links, self-only exchange; G3 with shuffled segments.
-    Arm("g1a", "graph", "qwen3vl", True, "graph_qwen3vl", "gnn_attn", False),
-    Arm("g1b", "graph", "qwen3vl", True, "graph_qwen3vl", "gnn_attn", True),
-    Arm("g1c", "graph", "qwen3vl", True, "graph_qwen3vl", "self_only", True),
-    Arm("g3a", "graph", "qwen3vl", True, "graph_qwen3vl", "gnn_attn", True, ("segments",), "shuffled"),
-    # Attention-free hypergraph: G0 (no scene exchange) plus segments, and its shuffled-segment ablation.
-    Arm("g5", "graph", "qwen3vl", True, "graph_qwen3vl", "mean", True, ("segments",)),
-    Arm("g5a", "graph", "qwen3vl", True, "graph_qwen3vl", "mean", True, ("segments",), "shuffled"),
-)
+GENERATION_MODELS = ("qwen3vl_2b", "qwen3vl_4b", "qwen3vl_8b", "gemini")
 SOURCES = tuple(
-    Arm(name, kind, model, False, name)
-    for name, kind, model in (
-        ("graph_qwen3vl", "graph", "qwen3vl"),
-        ("desc_qwen3vl", "description", "qwen3vl"),
-        ("graph_qwen3.5", "graph", "qwen3.5"),
-        ("desc_qwen3.5", "description", "qwen3.5"),
-        ("graph_gemini", "graph", "gemini"),
-        ("desc_gemini", "description", "gemini"),
-    )
+    Arm(f"{prefix}_{model}", kind, model, False, f"{prefix}_{model}")
+    for model in GENERATION_MODELS
+    for prefix, kind in (("graph", "graph"), ("desc", "description"))
 )
-
-
-def arm_contract(config):
-    return RECOMMENDATION_ARM_CONTRACT
 
 
 def registry(config):
-    return {arm.name: arm for arm in ARMS}
+    from rec_experiments import CONFIG_KEY
+
+    if CONFIG_KEY not in config:
+        raise ValueError("recommendation experiments are not loaded; load rec_experiments_config.yaml first")
+    sources = generation_registry()
+    result = {}
+    for row in config[CONFIG_KEY]["experiments"]:
+        source = sources.get(row["source"])
+        result[row["label"]] = Arm(
+            row["label"], source.representation if source else "metadata",
+            source.model if source else None, True, source.name if source else None,
+            row["readout"], "role_fusion" in row["modules"],
+            tuple(extension for extension, module in (("scene_attention", "scene_attention"),
+                                                      ("segments", "activity_hypergraph"))
+                  if module in row["modules"]),
+            (row["segments"]["variant"], row["segments"]["seed"]) if "segments" in row else None,
+        )
+    return result
 
 
 def feature_source(arm):
@@ -70,9 +55,11 @@ def target_set(config, target):
     return "_".join(select_arms(config, target))
 
 
+def resolve_target_arms(target=None, *, config):
+    return {name: name for name in select_arms(config, target)}
+
+
 def active_arms(config):
-    if "arms" in config.get("protocol", {}):
-        raise ValueError("protocol.arms is not supported; select --target explicitly")
     return list(registry(config))
 
 
@@ -80,22 +67,19 @@ def select_arms(config, target=None):
     registered = registry(config)
     names = active_arms(config) if target is None else target
     if not names or len(names) != len(set(names)) or set(names) - registered.keys():
-        raise ValueError(f"--target must select from {', '.join(registered)}")
+        raise ValueError(f"experiments must select from {', '.join(registered)}")
     return {name: arm for name, arm in registered.items() if name in names}
 
 
-def generation_registry(config):
-    sources = {arm.name: arm for arm in SOURCES}
-    if "minicpm" in config.get("models", {}):
-        sources["graph_minicpm"] = Arm("graph_minicpm", "graph", "minicpm", False, "graph_minicpm")
-    return sources
+def generation_registry():
+    return {arm.name: arm for arm in SOURCES}
 
 
-def generated_arm(config, representation, model):
-    if model not in {"gemini", "qwen3vl", "qwen3.5", "minicpm"}:
-        raise ValueError("model/source must be qwen3vl, qwen3.5, gemini or minicpm")
+def generated_arm(representation, model):
+    if model not in GENERATION_MODELS:
+        raise ValueError(f"model/source must be one of {', '.join(GENERATION_MODELS)}")
     source = next(
-        (arm for arm in generation_registry(config).values() if arm.representation == representation and arm.model == model),
+        (arm for arm in generation_registry().values() if arm.representation == representation and arm.model == model),
         None,
     )
     if source is None:
@@ -103,17 +87,15 @@ def generated_arm(config, representation, model):
     return source
 
 
-def resolve_generation_arm(config, name, representation, model, *, summary=False):
-    arm = generation_registry(config).get(name)
+def resolve_generation_arm(config, name, representation, model):
+    arm = generation_registry().get(name)
     if arm is None:
-        source = registry(config).get(name)
+        source = registry(config).get(name) if "_rec_experiments" in config else None
         hint = f"; use source --arm {source.scene_arm}" if source and source.scene_arm else ""
         raise ValueError(f"invalid generation source: {name}{hint}")
     if arm.representation != representation:
         raise ValueError(f"invalid {representation} generation arm: {name}")
-    if summary and arm.model == "minicpm":
-        raise ValueError("MiniCPM supports only Graph scene extraction, not summarization")
-    if not summary and arm.model != model:
+    if arm.model != model:
         raise ValueError(
             "Scene arm must identify the requested extraction model and representation"
         )
