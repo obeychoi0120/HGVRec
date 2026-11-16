@@ -162,7 +162,7 @@ def test_qwen3vl_4b_source_and_checkpoint(context, monkeypatch):
                      "--arm", "graph_qwen3vl_4b", "--repetition-penalty", "1.05",
                      "--stop-repeated-lines"]) == 0
     assert cli.main(["extract-description-scenes", *base,
-                     "--schema", "prompts/scene_description_v3.md"]) == 0
+                     "--schema", "prompts/scene_description_dwys.md"]) == 0
     assert [(c["model"], c["arm"]) for c in calls] == [("qwen3vl_4b", "graph_qwen3vl_4b"), ("qwen3vl_4b", None)]
 
     # Generation settings match the other sizes except for the recorded model key.

@@ -205,19 +205,19 @@ python -m preparation prepare-input-data --run-id "$RUN_ID" --dataset "$DATASET"
 ```bash
 # Main: 온디바이스 Qwen3-VL
 python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" \
-  --model qwen3vl_2b --schema prompts/scene_graph_v9_core.md
+  --model qwen3vl_2b --schema prompts/scene_graph_v8.md
 python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$DATASET" \
-  --model qwen3vl_2b --schema prompts/scene_description_v3.md
+  --model qwen3vl_2b --schema prompts/scene_description_dwys.md
 
 # 추가 실험: Gemini
 python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" \
-  --model gemini --schema prompts/scene_graph_v9_core.md
+  --model gemini --schema prompts/scene_graph_v8.md
 ```
 
 - `--model`은 `qwen3vl_2b`, `qwen3vl_4b`, `qwen3vl_8b`, `gemini` 중 하나입니다.
 - `--schema`는 [prompts/](prompts/)의 프롬프트 파일입니다.
-  - Graph: `scene_graph_v8.md`, `v8_2`, `v9_core`, `v9_extended`, `v10_core`, `v10_extended`
-  - Description: `scene_description_v3.md`
+  - Graph: `scene_graph_v8.md`(기본, 현재 실험 결과 기준). 그 밖에 `v8_2`, `v9_core`, `v9_extended`, `v10_core`, `v10_extended`도 쓸 수 있습니다.
+  - Description: `scene_description_dwys.md`
 - 로컬 Qwen에서만 쓰는 생성 옵션이 있습니다: `--presence-penalty`, `--repetition-penalty`, `--stop-repeated-lines`. 자세한 내용은 [장면 추출](docs/scene_extraction.md#qwen-생성-정책과-옵션)을 참고하세요.
 - 결과는 `artifacts/runs/<RUN_ID>/<dataset>/extraction/<source>/`에 저장됩니다.
 

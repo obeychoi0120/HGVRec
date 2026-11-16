@@ -649,9 +649,26 @@ v4는 `[Entities]`와 `[Relations]`를 사용하고, 관계를 `subject_id -> re
 
 ## scene_description
 
-대상(최신순): [v3](../prompts/scene_description_v3.md) → [v2](../prompts/scene_description_v2.md) → [v1](../prompts/scene_description_v1.md)
+대상(최신순): [dwys](../prompts/scene_description_dwys.md) → [v3(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_description_v3.md) → [v2(삭제됨)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_description_v2.md) → [v1(이름 변경: dwys)](https://github.com/obeychoi0120/ViewingContextPipeline/commits/HEAD/prompts/scene_description_v1.md)
 
 **개선 흐름: 직접 보이는 사실의 포괄적 묘사 → 근거 있는 의미 해석 허용 → 추천에 필요한 특징의 선택적 서술.**
+
+### 2026-11-16: v1을 `scene_description_dwys`로 이름 변경, v2·v3 삭제
+
+사용자가 `scene_description_v1.md`를 `scene_description_dwys.md`로 이름만 바꾸고(내용 동일, git rename 100%), `scene_description_v2.md`와 `scene_description_v3.md`를 삭제했습니다. 커밋 `e3fde07`에 포함되었고, 이 항목은 그 뒤에 기록했습니다.
+
+**결과.** 현재 Description 프롬프트는 dwys 하나입니다. 내용은 v1과 같아서, v2의 근거 있는 의미 해석 허용과 v3의 추천용 특성 선택 규칙이 없습니다. 장면을 빠짐없이 포괄적으로 묘사하고, 인물·장소 이름, 핵심 내용, 분위기, 대상 시청자, 문화적 맥락을 80–180단어(최대 350단어) 한 문단으로 쓰게 합니다.
+
+**변경 이유와 이름의 뜻.** 사용자가 밝히지 않아 기록하지 않습니다.
+
+**연동 변경.**
+- 테스트, README, `docs/scene_extraction.md`의 Description 프롬프트 참조를 v3에서 dwys로 바꿨습니다.
+- 파서·저장 형식은 바뀌지 않았습니다. Description 출력은 프롬프트와 무관하게 같은 필드로 저장합니다.
+- 프롬프트 해시가 v3와 다르므로, v3로 만든 기존 `desc_*` 결과와 dwys 결과는 생성 조건이 다릅니다.
+
+**검증한 것.** 참조를 바꾼 뒤 전체 테스트가 통과했습니다. 테스트는 가짜 생성기를 쓰므로 프롬프트 내용 자체는 검사하지 않습니다.
+
+**미검증.** dwys로 실제 장면을 생성하지 않았습니다. 출력 품질과 추천 성능에 미치는 영향은 확인하지 않았습니다.
 
 ### v2 → v3: 추천용 특성 추출로 목적 전환
 

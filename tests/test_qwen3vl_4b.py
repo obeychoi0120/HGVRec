@@ -34,7 +34,7 @@ def test_qwen3vl_4b_sources_run_extraction_to_diagnosis(context, monkeypatch, ca
     description = FakeGenerator("A person cuts a tomato with a knife in a kitchen.")
     monkeypatch.setattr("extraction.steps.qwen_generator", description)
     assert extraction_cli.main([
-        "extract-description-scenes", *base, "--schema", "prompts/scene_description_v3.md",
+        "extract-description-scenes", *base, "--schema", "prompts/scene_description_dwys.md",
         "--arm", "desc_qwen3vl_4b",
     ]) == 0
     assert len(graph.tasks) == len(description.tasks) == 48

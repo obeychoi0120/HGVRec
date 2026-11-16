@@ -112,7 +112,7 @@ def events(lengths=(5, 6, 13)):
 
 def make_context(root, lengths=(5, 6, 13)):
     root.mkdir(parents=True, exist_ok=True)
-    config = deepcopy(yaml.safe_load((ROOT / "config.yaml").read_text()))
+    config = deepcopy(yaml.safe_load((ROOT / "config.example.yaml").read_text()))
     rows = events(lengths)
     data = root / "data"
     videos = data / "videos"
@@ -158,7 +158,7 @@ def make_context(root, lengths=(5, 6, 13)):
     for name in (
         "scene_graph_v9_core.md",
         "scene_graph_v9_extended.md",
-        "scene_description_v3.md",
+        "scene_description_dwys.md",
     ):
         (prompts / name).write_text((ROOT / "prompts" / name).read_text())
     # A fixed experiment list, not the repository's: that file is git-ignored and edited per Run.
@@ -263,7 +263,7 @@ def prepare_inputs(context, monkeypatch, *, modules=True):
     generator = extract_scenes(context, monkeypatch)
     description = FakeGenerator("A person cuts a tomato with a knife in a kitchen.")
     monkeypatch.setattr("extraction.steps.qwen_generator", description)
-    extract_description_scenes(context, model="qwen3vl_2b", schema="prompts/scene_description_v3.md",
+    extract_description_scenes(context, model="qwen3vl_2b", schema="prompts/scene_description_dwys.md",
                                arm="desc_qwen3vl_2b")
     embed_representations(context, target=TARGETS)
     if modules:

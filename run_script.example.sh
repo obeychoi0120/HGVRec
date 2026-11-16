@@ -29,8 +29,6 @@ python -m preparation prepare-input-data "${COMMON[@]}"
 # Main experiments: on-device Qwen3-VL ($MODEL = qwen3vl_*).
 python -m extraction extract-graph-scenes "${COMMON[@]}" --model "$MODEL" --schema "$GRAPH_PROMPT" --repetition-penalty 1.05 1.10 1.15 --stop-repeated-lines
 python -m extraction extract-description-scenes "${COMMON[@]}" --model "$MODEL" --schema "$DESC_PROMPT"
-# Optional Qwen-only generation options:
-#   --presence-penalty 1.5 | --repetition-penalty 1.05 1.1 | --stop-repeated-lines (graph only)
 
 # Additional experiments: Gemini on Vertex AI (requirements-extra.txt, gcloud ADC login).
 # python -m extraction extract-graph-scenes "${COMMON[@]}" --model gemini --schema "$GRAPH_PROMPT"

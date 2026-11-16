@@ -10,8 +10,8 @@
 
 | 표현 | 프롬프트 | 추출 결과 |
 | --- | --- | --- |
-| Graph | [scene_graph_v9_core.md](../prompts/scene_graph_v9_core.md) · [scene_graph_v9_extended.md](../prompts/scene_graph_v9_extended.md) | 장면별 Context·Entities·Actions |
-| Description | [scene_description_v3.md](../prompts/scene_description_v3.md) | 장면별 관측 문단 |
+| Graph | [scene_graph_v8.md](../prompts/scene_graph_v8.md) (기본, 현재 실험 결과 기준). 이름 직접 참조 형식의 v9·v10도 지원 | 장면별 Context·Entities·Actions |
+| Description | [scene_description_dwys.md](../prompts/scene_description_dwys.md) | 장면별 관측 문단 |
 
 Graph는 `graph_qwen3vl_2b`·`graph_qwen3vl_4b`·`graph_qwen3vl_8b`·`graph_gemini`, Description은 `desc_qwen3vl_2b`·`desc_qwen3vl_4b`·`desc_qwen3vl_8b`·`desc_gemini` source에 저장합니다. 2B·4B·8B는 별도 source이므로 한 Run에서 함께 추출할 수 있습니다. 생성 명령에는 `--schema`, `--model`, `--arm`이 필요합니다. 상대 프롬프트 경로는 저장소 루트 기준이며 기존의 비어 있지 않은 Markdown 파일을 지정합니다.
 
@@ -20,35 +20,34 @@ Graph는 `graph_qwen3vl_2b`·`graph_qwen3vl_4b`·`graph_qwen3vl_8b`·`graph_gemi
 | 성분 | 기록할 내용 |
 | --- | --- |
 | Context | 표현 매체 `medium`, 형식 `format`, 주제 `topics` |
-| Entities | 중요한 개체의 이름·속성 |
-| Actions | `actor - action - target; tool: 이름; place: 이름`의 역할 구조 (tool·place는 해당할 때만) |
+| Entities | 중요한 개체의 짧은 ID·종류·속성 (`id: kind; attribute`) |
+| Actions | `actor - action - target; tool; location`의 다섯 칸 역할 구조 |
 
-다음은 출력 형식의 예시이며 실제 Run 결과가 아닙니다.
+다음은 기본 프롬프트 [v8](../prompts/scene_graph_v8.md)의 출력 형식 예시이며 실제 Run 결과가 아닙니다.
 
 ```text
 [Context]
 medium: live_action
 format: demonstration
-topics: food preparation
+topics: seafood preparation
 [Entities]
-person; wearing apron
-tomato
-knife
-kitchen
+p1: person; wearing apron
+f1: sea urchin
+t1: knife
+l1: kitchen
 [Actions]
-person - cutting - tomato; tool: knife; place: kitchen
-[End]
+p1 - cutting - f1; t1; l1
 ```
 
-역할에는 선언한 개체 이름을 공백·번호까지 정확히 복사하거나 `none`(부재·비해당), `unknown`(식별 불가)을 사용합니다. 같은 이름의 서로 다른 개체를 구분할 때만 `person1`, `person2` 같은 번호를 붙입니다. Actions가 없으면 `none`을 씁니다. `tool:`과 `place:`는 생략할 수 있으며, 생략한 tool은 `none`, 생략한 place는 `unknown`으로 저장합니다. 라벨 없이 `; knife; kitchen`처럼 위치로 쓴 이전 형식도 읽습니다.
+역할에는 선언한 엔티티 ID나 `none`(부재·비해당), `unknown`(식별 불가)을 씁니다. 다섯 칸은 항상 채우며, Actions가 없으면 `none`을 씁니다. v8의 `location` 역할은 저장·학습에서 `place`로 읽습니다.
 
-파서는 장면 안에서 이름을 내부 ID로 바꿉니다. 예를 들어 `person → e1`, `tomato → e2`로 변환하고 역할 참조도 연결합니다. `none`은 `null`, `unknown`은 문자열로 저장합니다. 미선언 역할 참조는 `unknown`으로 정규화하며 개체를 추측해 추가하지 않습니다.
+v9·v10은 ID 대신 엔티티 이름을 역할에 그대로 복사하는 형식입니다(예: `person - cutting - tomato; knife; kitchen`). 이 경우 파서가 장면 안에서 이름을 내부 ID로 바꿉니다(`person → e1`, `tomato → e2`). `none`은 `null`, `unknown`은 문자열로 저장합니다. 미선언 역할 참조는 `unknown`으로 정규화하며 개체를 추측해 추가하지 않습니다.
 
 이름·ID는 장면 내부에서만 유효합니다. 다른 장면에서 이름이나 번호가 같아도 동일 개체로 합치지 않으며 영상 간 Entity 노드도 공유하지 않습니다.
 
 ## 파싱과 지원 경계
 
-Graph 출력은 생성 시 JSON Schema로 강제하지 않습니다. 현행 `graph-text/v23` 파서는 위 이름 선언 형식, 기존 `id: kind; attribute` 선언 형식과 현재 구조의 JSON을 읽습니다. 한 출력 안의 두 선언 형식 혼용은 원문으로 보존합니다.
+Graph 출력은 생성 시 JSON Schema로 강제하지 않습니다. 현행 `graph-text/v25` 파서는 ID 선언 형식(`id: kind; attribute`, v8·v8_2), 이름 선언 형식(v9·v10)과 현재 구조의 JSON을 읽습니다. 한 출력 안의 두 선언 형식 혼용은 원문으로 보존합니다.
 
 이름 형식 출력이 엄격 파싱과 구분자 복구에 모두 실패하면 줄 모양으로 섹션을 나눕니다. `medium:`·`format:`·`topics:` 줄은 Context, 행동 구분자가 있는 줄은 Action, 나머지는 Entity입니다. 이때 다음과 같이 처리합니다.
 
@@ -73,7 +72,7 @@ Graph 출력은 생성 시 JSON Schema로 강제하지 않습니다. 현행 `gra
 
 정보가 없는 그래프(맥락이 전부 `unknown`/`none`이거나 엔티티·행동이 없음)를 따로 판정하던 `TRASH_INFO`는 `graph-text/v23`에서 없앴습니다. 이런 장면도 구조화에 성공하면 success로 사용합니다.
 
-이전 버전의 태그는 읽을 때 `MISSING_REQUIRED`·`PARSE_ERROR` → `PARSE_FAILED`, `TRUNCATION_RECOVERED` → `TOKEN_LIMIT`로 변환하고, 저장된 `TRASH_INFO`는 버린 뒤 현재 규칙으로 다시 판정합니다. `--force` 없이 재실행하면 먼저 저장된 행에 현재 규칙을 적용합니다. 이전의 절단 error 행은 `TOKEN_LIMIT` 행이 되고, `PARSE_FAILED` 원문은 현재 파서로 다시 읽습니다.
+`--force` 없이 재실행하면 먼저 저장된 `PARSE_FAILED` 원문을 현재 파서로 다시 읽고, 구조화에 성공하면 그대로 사용합니다. 현재 태그(`TOKEN_LIMIT`, `PARSE_FAILED`, `REPEAT_OCCURRED`) 외의 이전 버전 태그는 읽지 않습니다.
 
 기존 v8 JSON의 Action `location`은 읽기용 복사본에서 `place`로 정규화합니다. 두 필드가 함께 있으면 값이 같아도 거부합니다. 원본 파일은 수정하지 않으며 Relations·receiver·필수 장소 필드 누락 등은 자동으로 다른 스키마로 변환하지 않습니다. 지원하지 않는 입력은 경로·원인과 함께 오류로 처리합니다.
 
@@ -98,7 +97,7 @@ Greedy decoding의 설정은 `do_sample=False`, `temperature=0.0`, `top_p=1.0`, 
 Repetition penalty는 전용 logits processor를 사용하며 vLLM 기본 repetition penalty는 1.0으로 두어 중복 적용하지 않습니다. 값을 하나만 주면 최초 요청·구조 복구·재실행에 같은 값을 쓰고, 여러 개 주면 적은 순서대로 패스마다 하나씩 씁니다(자동 증가는 없습니다). `generation_identity.json`에는 첫 패스 값이 `generation.repetition_penalty`로, 전체 목록이 `repetition_penalty`로 기록됩니다. 예를 들어 Graph에 이전 기본값인 presence penalty 1.5를 적용하려면 다음과 같이 실행합니다.
 
 ```bash
-python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_core.md --model qwen3vl_2b --arm graph_qwen3vl_2b --presence-penalty 1.5
+python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v8.md --model qwen3vl_2b --arm graph_qwen3vl_2b --presence-penalty 1.5
 ```
 
 옵션은 새로 생성하는 결과와 provenance에 적용됩니다. 기존 정상 장면을 갱신하려면 새 Run 또는 해당 추출의 `--force`를 사용합니다. 생성 정책 변경의 형식 준수율·추천 성능 효과는 별도의 비교가 필요합니다.
@@ -110,8 +109,8 @@ python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET
 추가 실험 의존성(`requirements-extra.txt`)을 설치하고 `models.gemini`에 Vertex 프로젝트·위치·모델·생성 설정을 지정합니다. 실행 환경에 ADC 인증(`gcloud auth application-default login`)과 호출 권한이 필요하며 전체 장면 동시성은 `extraction.gemini.threads`로 정합니다. 로컬 Qwen용 penalty 옵션은 Gemini에 지정할 수 없습니다.
 
 ```bash
-python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v9_core.md --model gemini --arm graph_gemini
-python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_description_v3.md --model gemini --arm desc_gemini
+python -m extraction extract-graph-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_graph_v8.md --model gemini --arm graph_gemini
+python -m extraction extract-description-scenes --run-id "$RUN_ID" --dataset "$DATASET" --schema prompts/scene_description_dwys.md --model gemini --arm desc_gemini
 ```
 
 생성한 source를 추천 YAML에 명시해 특징·추천 실험에 연결합니다. source가 다르면 특징은 별도로 준비합니다. 같은 추천 조건으로 모델 소스를 비교하더라도 실제 생성 관측·장면 확보율 차이를 포함해 해석해야 합니다.
