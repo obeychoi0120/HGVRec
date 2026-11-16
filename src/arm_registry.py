@@ -46,7 +46,9 @@ def registry(config):
             row["label"], source.representation if source else "metadata",
             source.model if source else None, True, source.name if source else None,
             row["readout"], "role_fusion" in row["modules"],
-            ("segments",) if "activity_hypergraph" in row["modules"] else (),
+            tuple(extension for extension, module in (("scene_attention", "scene_attention"),
+                                                      ("segments", "activity_hypergraph"))
+                  if module in row["modules"]),
             (row["segments"]["variant"], row["segments"]["seed"]) if "segments" in row else None,
         )
     return result

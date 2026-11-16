@@ -66,7 +66,11 @@ def recommendation_identity(context, branch):
     if arm.extensions:
         from validation.graph_context import EXTENSION_MODELS
 
-        identity["item_model"]["extensions"] = {e: EXTENSION_MODELS[e] for e in sorted(arm.extensions)}
+        identity["item_model"]["extensions"] = {e: dict(EXTENSION_MODELS[e]) for e in sorted(arm.extensions)}
+        if {"scene_attention", "segments"} <= set(arm.extensions):
+            from validation.graph_context import SEGMENTS_AFTER_SCENE_ATTENTION
+
+            identity["item_model"]["extensions"]["segments"]["applied_after"] = SEGMENTS_AFTER_SCENE_ATTENTION
     if "segments" in arm.extensions:
         from validation.graph_inputs import scene_segments_identity
 

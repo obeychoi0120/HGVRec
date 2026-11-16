@@ -9,12 +9,14 @@ CONFIG_PATH = Path("rec_experiments_config.yaml")
 CONFIG_KEY = "_rec_experiments"
 MODULE_VERSIONS = {
     "role_fusion": "role-fusion/v1",
+    "scene_attention": "gnn-attn/v1",
     "activity_hypergraph": "segments-v1",
 }
 # Names written in rec_experiments_config.yaml. Results keep the internal names
 # above in their identity, so renaming config entries never invalidates a Run.
 MODULE_ALIASES = {
     "REAF": "role_fusion",
+    "GNN_ATTN": "scene_attention",
     "ASHA": "activity_hypergraph",
 }
 
@@ -103,6 +105,8 @@ def experiment_definition(arm):
     from arm_registry import feature_source
 
     modules = (["role_fusion"] if arm.role_fusion else [])
+    if "scene_attention" in arm.extensions:
+        modules.append("scene_attention")
     if "segments" in arm.extensions:
         modules.append("activity_hypergraph")
     definition = {"label": arm.name, "source": feature_source(arm), "modules": modules,

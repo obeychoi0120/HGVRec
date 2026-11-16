@@ -7,6 +7,7 @@ from validation.graph_inputs import GraphStore
 from validation.graph_context import GRAPH_MODEL, check_extensions
 from validation.graph_batching import PackedGraphStore, GRAPH_EXECUTION_VERSION
 from validation.config import GraphExecutionConfig
+from validation.scene_attention import scene_groups, unit_rms
 
 
 def segment_mean(values, indices, count):
@@ -23,8 +24,42 @@ def xavier_normal(rows, columns, generator):
     return torch.empty(rows, columns).normal_(0.0, std, generator=generator)
 
 
+class SceneAttentionExchange(nn.Module):
+    """One single-head attention exchange among the scenes of each video: h + relu(P (A h) + p).
+
+    Scores use the title-free scene content before the Scene MLP; values are Scene MLP outputs.
+    Weights come from a private RNG and are bare Parameters (untouched by the Linear reset), so
+    every other parameter starts as in the matching model without the exchange.
+    """
+
+    def __init__(self, dimension, similarity_dim, key_dim):
+        super().__init__()
+        generator = torch.Generator().manual_seed((torch.initial_seed() + 20) % 2**63)
+        # N(0, 1/(2 fan_in)) on unit-RMS inputs gives attention logits of std ~0.5.
+        std = (2 * similarity_dim) ** -0.5
+        self.query = nn.Parameter(torch.empty(key_dim, similarity_dim).normal_(0.0, std, generator=generator))
+        self.key = nn.Parameter(torch.empty(key_dim, similarity_dim).normal_(0.0, std, generator=generator))
+        self.projection = nn.Parameter(xavier_normal(dimension, dimension, generator))
+        self.projection_bias = nn.Parameter(torch.zeros(dimension))
+
+    def attention(self, similarity):
+        """[videos, n, similarity_dim] -> row-softmax weights [videos, n, n], self included."""
+        units = unit_rms(similarity)
+        scores = (units @ self.query.t()) @ (units @ self.key.t()).transpose(-1, -2)
+        return (scores / self.query.shape[0] ** 0.5).softmax(dim=-1)
+
+    def forward(self, scenes, similarity, groups):
+        output = torch.zeros_like(scenes)
+        for indices in groups:  # [videos, n] batch-local scene rows of videos with n scenes
+            values = scenes[indices]
+            mixed = self.attention(similarity[indices]) @ values
+            updated = values + nn.functional.relu(mixed @ self.projection.t() + self.projection_bias)
+            output = output.index_copy(0, indices.reshape(-1), updated.flatten(0, 1))
+        return output
+
+
 class SceneRoleEncoder(nn.Module):
-    """Role Fusion (B), Scene MLP, optional hypergraph (A) and mean readout."""
+    """Role Fusion (B), Scene MLP, optional scene attention exchange, optional hypergraph (A), mean readout."""
 
     ROLE_INDICES = (0, 1, 2, 4)  # actor, target, tool, place; receiver is ignored.
 
@@ -44,6 +79,8 @@ class SceneRoleEncoder(nn.Module):
             self.role_states = nn.Parameter(torch.empty(4, 2, hidden))
             nn.init.normal_(self.role_states, std=0.02)
         self.scene_mlp = SingleLayerResidualMLP(self.output_dim)
+        if "scene_attention" in self.extensions:
+            self.scene_attention = SceneAttentionExchange(self.output_dim, hidden * 3, hidden)
         if "segments" in self.extensions:
             # Private RNG preserves the matching non-hypergraph model at gate 0.
             generator = torch.Generator().manual_seed((torch.initial_seed() + 18) % 2**63)
@@ -72,7 +109,7 @@ class SceneRoleEncoder(nn.Module):
         return entities, states
 
     def _segments(self, batch, scenes, video_count):
-        """Hypergraph after Scene MLP; returns scenes and per-video segment readout."""
+        """Hypergraph after Scene MLP (and the scene exchange, if any); returns scenes and per-video segment readout."""
         members, ids = batch["segment_scenes"], batch["segment_ids"]
         videos = batch["scene_videos"]
         # Batch-local segment ids are dense and fewer than the incidence pairs.
@@ -137,6 +174,13 @@ class SceneRoleEncoder(nn.Module):
             scene_title = title[batch["scene_videos"]]
             scenes = torch.cat([scene_title, entity_mean, action_mean, context], dim=-1)
             scenes = self.scene_mlp(scenes)
+            if "scene_attention" in self.extensions:
+                groups = [value for key, value in batch.items() if key.startswith("scene_group_")]
+                if not groups:
+                    groups = [torch.as_tensor(value, device=scenes.device)
+                              for value in scene_groups(batch["offsets"]).values()]
+                similarity = torch.cat([entity_mean, action_mean, context], dim=-1)
+                scenes = self.scene_attention(scenes, similarity, groups)
             if "segments" in self.extensions:
                 scenes, segment_readout = self._segments(batch, scenes, video_count)
         output = segment_mean(scenes, batch["scene_videos"], video_count)
@@ -279,30 +323,40 @@ class GraphSASRec(SASRec):
             + edges * hidden * 4
             + scenes * (feature + self.embedding_dim * 12)
         )
+        if "scene_attention" in getattr(self.graph_encoder, "extensions", ()):
+            pairs = int(np.square(self.packed.scene_counts[indices]).sum())
+            estimate += 4 * (pairs * 8 + scenes * (self.embedding_dim * 8 + hidden * 4))
         free, _ = torch.cuda.mem_get_info(device)
         return estimate > min(8 * 1024**3, int(free * 0.35))
 
     def _batch_options(self):
         options = {}
-        if "segments" in getattr(self.graph_encoder, "extensions", ()):
+        extensions = getattr(self.graph_encoder, "extensions", ())
+        if "segments" in extensions:
             options["scene_segments"] = True
+        if "scene_attention" in extensions:
+            options["scene_groups"] = True
         return options
 
     def _calculate(self, ids):
         from torch.utils.checkpoint import checkpoint
 
+        exchange = "scene_attention" in getattr(self.graph_encoder, "extensions", ())
         vectors, chunks = [], []
-        chunk, nodes = [], 0
+        chunk, nodes, scene_pairs = [], 0, 0
         for item in ids:
             count = int(self.packed.node_counts[item - 1])
+            pairs = int(self.packed.scene_counts[item - 1]) ** 2
             if chunk and (
                 len(chunk) >= self.execution.chunk_items
                 or nodes + count > self.execution.chunk_nodes
+                or (exchange and scene_pairs + pairs > self.execution.chunk_scene_pairs)
             ):
                 chunks.append(chunk)
-                chunk, nodes = [], 0
+                chunk, nodes, scene_pairs = [], 0, 0
             chunk.append(item)
             nodes += count
+            scene_pairs += pairs
         if chunk:
             chunks.append(chunk)
         use_checkpoint = self._use_checkpoint(ids)
@@ -369,6 +423,10 @@ class GraphSASRec(SASRec):
         if "segments" in getattr(self.graph_encoder, "extensions", ()):
             gates = self.graph_encoder.segment_gates.detach().cpu().tolist()
             report["segment_gates"] = {"scene_update": float(gates[0]), "video_readout": float(gates[1])}
+        if "scene_attention" in getattr(self.graph_encoder, "extensions", ()):
+            exchange = self.graph_encoder.scene_attention
+            report["scene_attention_norms"] = {name: float(getattr(exchange, name).detach().norm())
+                                               for name in ("query", "key", "projection")}
         return report
 
 

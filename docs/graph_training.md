@@ -33,6 +33,22 @@ Action' = Action + ReLU(Linear_640_to_128(role_input))
 
 연결이 없는 역할에는 absent/unknown 상태 임베딩을 사용합니다. Entity 자체는 갱신하지 않습니다. 모듈이 없으면 Fusion층·역할 상태 임베딩을 만들지 않으며 투영된 Action을 사용합니다. 이 모듈은 단독으로도 사용할 수 있고 장면 간 동일 개체 연결을 만들지는 않습니다.
 
+## scene_attention
+
+설정 이름은 `GNN_ATTN`입니다. 같은 영상의 장면끼리 단일 head attention으로 정보를 주고받는 교환층 하나를 Scene MLP 뒤, `activity_hypergraph` 앞에 둡니다. 다른 영상의 장면과는 섞지 않으며 장면 순서 정보는 쓰지 않습니다.
+
+```text
+x_s = [entity_mean; action_mean; context]          # 384, 제목 없음, Scene MLP 이전
+u_s = x_s / max(|x_s|, 1e-8) * sqrt(384)
+a_st = softmax_t(W_q u_s · W_k u_t / sqrt(128))      # 같은 영상의 t, 자기 자신 포함
+h'_s = h_s + ReLU(P (Σ_t a_st h_t) + p)             # h: Scene MLP 출력(512, 제목 포함)
+z = mean(h'_s)
+```
+
+비중은 제목이 빠진 장면 내용으로만 정하고, 섞는 값은 Scene MLP 출력입니다. 장면이 1개인 영상은 `h + ReLU(P h + p)`가 되고, 유효 장면이 없는 영상은 기존 제목 fallback을 사용합니다. `W_q`, `W_k`(128×384, bias 없음)는 N(0, (2·384)^-1/2)로 초기화해 학습 시작 시 logit 표준편차가 약 0.5가 되게 합니다. `P`(512×512)는 xavier normal, `p`는 0입니다. 모든 가중치는 `torch.initial_seed() + 20`으로 시드를 정한 전용 generator에서 만들므로, 나머지 파라미터의 초기값은 이 모듈이 없는 같은 seed 모델과 같습니다. 이 모듈은 학습 시작 시점에 장면 평균과 같지 않습니다. 추가 파라미터는 360,960개입니다.
+
+장면 수가 같은 영상끼리 묶어 `[영상 수, n, n]` 행렬로 계산하고, 한 청크의 Σn²가 `chunk_scene_pairs`를 넘지 않게 나눕니다. 예전 실험 코드의 `gnn_attn`(커밋 `bad5f2c`)과 수식·초기 분포가 같습니다. [교환층](../src/validation/graph_model.py) · [그룹 계산](../src/validation/scene_attention.py) · [계약](../src/validation/graph_context.py).
+
 ## activity_hypergraph
 
 활동 구간은 고정 전처리입니다. Action 문구에서 참여자 표식·일부 기능어를 제외한 첫 단어에 어미 제거·불규칙형 치환 규칙을 적용해 활동 키를 만듭니다. 같은 키가 연속된 원본 장면 번호에 나타나면 구간으로 묶습니다. 번호 단절이나 활동 재등장은 새 구간이며 길이 1 구간·중첩 구간을 허용합니다.
@@ -45,7 +61,7 @@ h'_s = h_s + gate_scene * ReLU(W_s [h_s; mean(u_k for k containing s)] + b_s)
 z = mean(h'_s) + gate_video * W_v mean(u_k)
 ```
 
-구간에 속하지 않는 장면은 갱신하지 않습니다. 구간 기여는 구간별 동일 가중치 평균이며, 두 게이트는 0에서 시작하는 학습 가능한 스칼라입니다. 구간이 없는 영상은 장면 평균을 사용합니다. Scene MLP 출력이 모듈의 입력이며, 이 모듈이 현행 모델에서 장면 간 전달을 수행하는 경로입니다. 영상 노드와 Scene GCN은 만들지 않습니다.
+구간에 속하지 않는 장면은 갱신하지 않습니다. 구간 기여는 구간별 동일 가중치 평균이며, 두 게이트는 0에서 시작하는 학습 가능한 스칼라입니다. 구간이 없는 영상은 장면 평균을 사용합니다. Scene MLP 출력이 모듈의 입력이며, `scene_attention`이 함께 있으면 교환 뒤의 장면 벡터가 입력입니다. 영상 노드는 만들지 않습니다.
 
 구간은 `<source>` 특징 디렉터리의 `scene_segments.npy`·`scene_segments.json`으로 준비합니다. 구간 계약은 `scene-segments/v2`이며 입력 해시·생성 코드 해시·checksum을 검증하고 추천 identity에 포함합니다. source가 같으면 여러 실험이 구간 파일을 공유합니다. 준비는 VLM·BGE 재추론 없이 수행합니다.
 

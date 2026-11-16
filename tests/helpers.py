@@ -395,3 +395,39 @@ def quiet_progress():
         update_stats=lambda *a: None,
         write_log=lambda *a: None,
     )
+
+
+# Experiments of rec_experiments_config.yaml before GNN_ATTN existed (2026-11-16); the file
+# itself is untracked, so the identity regression keeps its own copy.
+PRE_SCENE_ATTENTION_EXPERIMENTS = [
+    {"label": "base", "source": "metadata", "modules": []},
+    {"label": "description", "source": "desc_qwen3vl_2b", "modules": []},
+    {"label": "graph", "source": "graph_qwen3vl_2b", "modules": []},
+    {"label": "graph+ASHA", "source": "graph_qwen3vl_2b", "modules": ["ASHA"]},
+    {"label": "graph+REAF", "source": "graph_qwen3vl_2b", "modules": ["REAF"]},
+    {"label": "HGVRec", "source": "graph_qwen3vl_2b", "modules": ["REAF", "ASHA"]},
+    {"label": "HGVRec_8b", "source": "graph_qwen3vl_8b", "modules": ["REAF", "ASHA"]},
+    {"label": "HGVRec-bag", "source": "graph_qwen3vl_2b", "modules": ["REAF", "ASHA"], "segments": "action_bag"},
+    {"label": "HGVRec-window", "source": "graph_qwen3vl_2b", "modules": ["REAF", "ASHA"], "segments": "time_window"},
+    {"label": "HGVRec-random", "source": "graph_qwen3vl_2b", "modules": ["REAF", "ASHA"], "segments": "random"},
+]
+
+
+def experiment_identities(context, monkeypatch, rows=PRE_SCENE_ATTENTION_EXPERIMENTS):
+    """recommendation_identity of each row, with bundle state and segment sidecars stubbed.
+
+    Only the experiment-dependent parts vary; the stubs keep them free of bundle contents.
+    """
+    import validation.graph_inputs as graph_inputs
+    import validation.representation_provenance as provenance
+    from rec_experiments import CONFIG_KEY, parse_experiments
+
+    context.config[CONFIG_KEY] = parse_experiments({"version": 1, "experiments": deepcopy(rows)})
+    monkeypatch.setattr(provenance, "read_state", lambda context, branch: {"recommendation_hash": "stub"})
+    monkeypatch.setattr(graph_inputs, "scene_segments_identity",
+                        lambda directory, variant=None: {"stub": list(variant) if variant else None})
+    identities = {row["label"]: provenance.recommendation_identity(context, row["label"]) for row in rows}
+    for identity in identities.values():
+        # The fixture encoder's file signature depends on the temporary tree, not the experiment.
+        identity["encoder"].pop("model")
+    return {"experiments": context.config[CONFIG_KEY], "identities": identities}

@@ -50,7 +50,7 @@ experiments:
 | `defaults.readout` | 선택 항목. 생략하면 `mean`. 공통 `source`는 허용하지 않습니다. |
 | `experiments[].label` | 필수 사용자 지정 이름. 소문자 영문으로 시작하고 영문 소문자·숫자·하이픈만 사용하며 중복은 허용하지 않습니다. 모델 구조를 결정하지 않습니다. |
 | `experiments[].source` | 각 실험에 필수. `metadata`, `graph_qwen3vl_2b`, `desc_qwen3vl_2b`, `graph_qwen3vl_8b`, `desc_qwen3vl_8b`, `graph_gemini`, `desc_gemini` 중 선택합니다. |
-| `experiments[].modules` | 생략하면 `[]`. Graph source에서 `REAF`(role_fusion), `ASHA`(activity_hypergraph)를 단독 또는 함께 사용할 수 있습니다. 결과 identity에는 괄호 안의 내부 이름이 기록되며, 내부 이름도 설정에서 계속 읽습니다. |
+| `experiments[].modules` | 생략하면 `[]`. Graph source에서 `REAF`(role_fusion), `GNN_ATTN`(scene_attention), `ASHA`(activity_hypergraph)를 단독 또는 함께 사용할 수 있습니다. 결과 identity에는 괄호 안의 내부 이름이 기록되며, 내부 이름도 설정에서 계속 읽습니다. |
 | `experiments[].readout` | 개별 값 → 공통값 → `mean` 순서로 적용합니다. 현재 `mean`만 지원합니다. |
 | `experiments[].segments` | 선택 항목. `ASHA`가 있는 실험에서만 허용합니다. 생략하면 기본 활동 구간을 사용하고 기존 결과 identity가 바뀌지 않습니다. `action_bag`, `time_window`, `random` 중 하나를 지정하면 모델 구조는 같고 장면–구간 소속만 바꾼 ablation이 됩니다. 아래 표를 참고하세요. |
 | `experiments[].segments_seed` | 선택 항목. 생략하면 `0`. `segments` 변형을 만드는 난수 seed이며 0 이상의 정수입니다. 모델 학습 seed와는 별개입니다. |
@@ -223,10 +223,11 @@ GPU는 `CUDA_VISIBLE_DEVICES`로 선택합니다. Qwen은 GPU별 추론 엔진�
 | Description | 제목·장면 문단 특징 → 투영·Residual Scene MLP → 장면 평균 |
 | Graph | 제목·Entity·Action·Context 특징 → 투영·장면 내부 평균 → Residual Scene MLP |
 | `REAF` (`role_fusion`) | Scene MLP 앞에서 역할별 Entity를 Action에 결합 |
+| `GNN_ATTN` (`scene_attention`) | Scene MLP 뒤에서 같은 영상의 장면끼리 단일 head attention으로 정보를 교환 |
 | `ASHA` (`activity_hypergraph`) | Scene MLP 뒤에서 장면–활동 구간 전달과 구간 기여를 적용 |
 | 공통 추천기 | 이력 영상 벡터 → SASRec·User MLP → 후보 영상 벡터와 내적 |
 
-모듈 목록 순서와 무관하게 역할 결합 → Scene MLP → 활동 Hypergraph → 영상 집계 순서로 적용합니다. 장면 내부 Entity ID는 영상 간 공유 노드가 아니며, 장면 간 동일 개체 추적이나 명시적 사건 관계는 구현하지 않습니다. SASRec의 사용자 시청 순서와 영상 내부 장면 관계는 구분합니다.
+모듈 목록 순서와 무관하게 역할 결합 → Scene MLP → 장면 attention 교환 → 활동 Hypergraph → 영상 집계 순서로 적용합니다. 장면 내부 Entity ID는 영상 간 공유 노드가 아니며, 장면 간 동일 개체 추적이나 명시적 사건 관계는 구현하지 않습니다. SASRec의 사용자 시청 순서와 영상 내부 장면 관계는 구분합니다.
 
 | 상세 문서 | 내용 |
 | --- | --- |

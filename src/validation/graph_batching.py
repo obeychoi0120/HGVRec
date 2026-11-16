@@ -74,7 +74,7 @@ class PackedGraphStore:
         values = np.array(self.store["features"][ids])
         return torch.as_tensor(values, device=device)
 
-    def batch(self, item_ids, device, *, prepared=True, scene_segments=False):
+    def batch(self, item_ids, device, *, prepared=True, scene_segments=False, scene_groups=False):
         items = np.asarray(item_ids, dtype=np.int64)
         nodes, node_videos, node_offsets = ranges(
             self.video_nodes[items], self.video_nodes[items + 1]
@@ -98,6 +98,11 @@ class PackedGraphStore:
             indices, owners, _ = ranges(self.segment_bounds[scenes], self.segment_bounds[scenes + 1])
             arrays["segment_scenes"] = owners
             arrays["segment_ids"] = np.unique(np.asarray(pairs[indices, 1]), return_inverse=True)[1].reshape(-1)
+        if scene_groups:
+            from validation.scene_attention import scene_groups as groups
+
+            # Only the scene_attention extension asks for groups, so other batches stay byte-identical.
+            arrays.update(groups(offsets))
         if prepared:
             action_ids = np.flatnonzero(types == 1)
             action_rows = np.full(len(nodes), -1, dtype=np.int64)
