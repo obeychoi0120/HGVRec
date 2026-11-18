@@ -1,4 +1,4 @@
-# ViewingContextPipeline
+# HGVRec
 
 짧은 영상의 키프레임에서 **온디바이스 멀티모달 LLM으로 장면 그래프를 추출**하고, 이를 시퀀셜 추천(SASRec)의 영상 표현으로 쓰는 연구용 파이프라인입니다. MicroLens-100K와 M³L-10M 데이터셋을 지원합니다.
 
@@ -52,8 +52,8 @@ conda install -c conda-forge ffmpeg -y
 | [requirements-dev.txt](requirements-dev.txt) | Main + 테스트·lint(`pytest`, `ruff`) |
 
 ```bash
-git clone <repo-url> ViewingContextPipeline
-cd ViewingContextPipeline
+git clone <repo-url> HGVRec
+cd HGVRec
 pip install -r requirements-main.txt
 pip install -e .
 ```

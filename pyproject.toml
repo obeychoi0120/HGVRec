@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "viewing-context-pipeline"
+name = "hgvrec"
 version = "0.1.0"
 description = "Viewing-context scene graphs from on-device VLMs for video recommendation (research PoC)"
 readme = "README.md"
@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 # Kept in sync with requirements-main.txt / requirements-extra.txt / requirements-dev.txt.
 main = ["torch", "transformers>=5.2.0", "vllm>=0.28.0; sys_platform == 'linux'"]
-extra = ["viewing-context-pipeline[main]", "google-genai"]
+extra = ["hgvrec[main]", "google-genai"]
 dev = ["pytest", "ruff"]
 
 [tool.setuptools]
